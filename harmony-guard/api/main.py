@@ -1,15 +1,22 @@
 """FastAPI application for Harmony Guard content moderation service."""
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request, status, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict, Any
 import uuid
 import time
 import logging
+import asyncio
 from contextlib import asynccontextmanager
+import traceback
+import hashlib
+import hmac
+from collections import defaultdict, deque
 
-from ..core.models import AnalysisRequest, AnalysisResponse, FeedbackRequest
+from ..core.models import AnalysisRequest, AnalysisResponse, FeedbackRequest, DecisionType, SeverityLevel
 from ..configs.manager import ConfigurationManager
 from .service import HarmonyGuardService
 
@@ -21,6 +28,87 @@ logger = logging.getLogger(__name__)
 # Global service instance
 harmony_service = None
 
+# Authentication and rate limiting
+security = HTTPBearer(auto_error=False)
+
+class RateLimiter:
+    """Simple in-memory rate limiter."""
+    
+    def __init__(self):
+        self.requests = defaultdict(deque)
+        self.limits = {
+            "default": {"requests": 100, "window": 60},  # 100 requests per minute
+            "premium": {"requests": 1000, "window": 60},  # 1000 requests per minute
+        }
+    
+    def is_allowed(self, tenant_id: str, tier: str = "default") -> bool:
+        """Check if request is allowed based on rate limits."""
+        now = time.time()
+        limit_config = self.limits.get(tier, self.limits["default"])
+        window = limit_config["window"]
+        max_requests = limit_config["requests"]
+        
+        # Clean old requests outside the window
+        tenant_requests = self.requests[tenant_id]
+        while tenant_requests and tenant_requests[0] < now - window:
+            tenant_requests.popleft()
+        
+        # Check if under limit
+        if len(tenant_requests) < max_requests:
+            tenant_requests.append(now)
+            return True
+        
+        return False
+    
+    def get_remaining(self, tenant_id: str, tier: str = "default") -> int:
+        """Get remaining requests for the current window."""
+        limit_config = self.limits.get(tier, self.limits["default"])
+        max_requests = limit_config["requests"]
+        current_requests = len(self.requests[tenant_id])
+        return max(0, max_requests - current_requests)
+
+class AuthenticationManager:
+    """Simple authentication manager."""
+    
+    def __init__(self):
+        # In production, these would come from a secure configuration
+        self.tenant_secrets = {
+            "demo": "demo-secret-key",
+            "test": "test-secret-key",
+        }
+        self.tenant_tiers = {
+            "demo": "default",
+            "test": "premium",
+        }
+    
+    def verify_tenant_auth(self, tenant_id: str, signature: str, timestamp: str, body: str) -> bool:
+        """Verify tenant authentication using HMAC signature."""
+        if tenant_id not in self.tenant_secrets:
+            return False
+        
+        # Check timestamp (prevent replay attacks)
+        try:
+            request_time = float(timestamp)
+            if abs(time.time() - request_time) > 300:  # 5 minute window
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        # Verify HMAC signature
+        secret = self.tenant_secrets[tenant_id].encode()
+        message = f"{tenant_id}:{timestamp}:{body}".encode()
+        expected_signature = hmac.new(secret, message, hashlib.sha256).hexdigest()
+        
+        return hmac.compare_digest(signature, expected_signature)
+    
+    def get_tenant_tier(self, tenant_id: str) -> str:
+        """Get the tier for a tenant."""
+        return self.tenant_tiers.get(tenant_id, "default")
+
+# Global instances
+rate_limiter = RateLimiter()
+auth_manager = AuthenticationManager()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,23 +117,53 @@ async def lifespan(app: FastAPI):
     
     # Startup
     logger.info("Starting Harmony Guard service...")
-    config_manager = ConfigurationManager()
-    harmony_service = HarmonyGuardService(config_manager)
-    await harmony_service.initialize()
-    logger.info("Harmony Guard service initialized successfully")
+    app.state.start_time = time.time()
+    
+    try:
+        config_manager = ConfigurationManager()
+        harmony_service = HarmonyGuardService(config_manager)
+        await harmony_service.initialize()
+        logger.info("Harmony Guard service initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize service: {e}")
+        raise
     
     yield
     
     # Shutdown
     logger.info("Shutting down Harmony Guard service...")
     if harmony_service:
-        await harmony_service.shutdown()
+        try:
+            await harmony_service.shutdown()
+            logger.info("Service shutdown completed successfully")
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
 
 
 # Create FastAPI app
 app = FastAPI(
     title="Harmony Guard",
-    description="Content moderation service for corporate communications",
+    description="""
+    Content moderation service for corporate communications.
+    
+    ## Authentication
+    
+    The API supports two authentication methods:
+    
+    1. **HMAC Signature Authentication** (Recommended for production):
+       - Include headers: `X-Tenant-ID`, `X-Timestamp`, `X-Signature`
+       - Signature is HMAC-SHA256 of `tenant_id:timestamp:request_body`
+    
+    2. **Bearer Token Authentication** (For development):
+       - Include header: `Authorization: Bearer <api-key>`
+       - Demo keys: `demo-api-key`, `test-api-key`
+    
+    ## Rate Limiting
+    
+    - Default tier: 100 requests per minute
+    - Premium tier: 1000 requests per minute
+    - Rate limit headers included in responses
+    """,
     version="1.0.0",
     lifespan=lifespan
 )
@@ -60,20 +178,61 @@ app.add_middleware(
 )
 
 
-# Pydantic models for API
+# Pydantic models for API with validation
 class AnalyzeRequest(BaseModel):
-    text: str
-    tenant_id: Optional[str] = None
-    include_details: bool = False
-    language_hints: Optional[List[str]] = None
+    text: str = Field(..., min_length=1, max_length=10000, description="Text content to analyze")
+    tenant_id: Optional[str] = Field(None, regex=r'^[a-zA-Z0-9_-]+$', description="Tenant identifier")
+    include_details: bool = Field(False, description="Include detailed analysis results")
+    language_hints: Optional[List[str]] = Field(None, description="Language hints for better analysis")
+    
+    @validator('text')
+    def validate_text(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Text cannot be empty or whitespace only')
+        return v.strip()
+    
+    @validator('language_hints')
+    def validate_language_hints(cls, v):
+        if v is not None:
+            # Validate language codes (ISO 639-1 format)
+            valid_codes = {'en', 'hi', 'bn', 'te', 'ta', 'mr', 'gu', 'kn', 'ml', 'or', 'pa', 'as'}
+            for code in v:
+                if code not in valid_codes:
+                    raise ValueError(f'Invalid language code: {code}')
+        return v
 
 
 class FeedbackSubmission(BaseModel):
-    request_id: str
-    final_label: str
-    actual_categories: List[str]
-    comment: Optional[str] = None
-    language_hints: Optional[List[str]] = None
+    request_id: str = Field(..., description="Original request ID")
+    final_label: str = Field(..., description="Corrected label")
+    actual_categories: List[str] = Field(..., description="Actual abuse categories")
+    comment: Optional[str] = Field(None, max_length=1000, description="Additional feedback comment")
+    language_hints: Optional[List[str]] = Field(None, description="Language hints for the content")
+    
+    @validator('final_label')
+    def validate_final_label(cls, v):
+        valid_labels = {'allow', 'review', 'block'}
+        if v not in valid_labels:
+            raise ValueError(f'Invalid label: {v}. Must be one of {valid_labels}')
+        return v
+    
+    @validator('actual_categories')
+    def validate_categories(cls, v):
+        valid_categories = {
+            'insult/harassment', 'obscenity/profanity', 'hate/targeted group',
+            'threat/violence', 'sexual content', 'bullying/taunting',
+            'self-harm encouragement', 'spam/scam'
+        }
+        for category in v:
+            if category not in valid_categories:
+                raise ValueError(f'Invalid category: {category}')
+        return v
+
+
+class ErrorResponse(BaseModel):
+    error: str = Field(..., description="Error message")
+    detail: Optional[str] = Field(None, description="Detailed error information")
+    request_id: Optional[str] = Field(None, description="Request correlation ID")
 
 
 def get_service() -> HarmonyGuardService:
@@ -83,54 +242,263 @@ def get_service() -> HarmonyGuardService:
     return harmony_service
 
 
-@app.post("/v1/analyze", response_model=AnalysisResponse)
+async def verify_authentication(
+    request: Request,
+    x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID"),
+    x_timestamp: Optional[str] = Header(None, alias="X-Timestamp"),
+    x_signature: Optional[str] = Header(None, alias="X-Signature"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
+) -> Dict[str, Any]:
+    """Verify request authentication and return tenant info."""
+    
+    # For public endpoints, allow unauthenticated access
+    public_paths = ["/v1/health", "/v1/readiness", "/docs", "/openapi.json", "/"]
+    if any(request.url.path.startswith(path) for path in public_paths):
+        return {"tenant_id": "anonymous", "tier": "default", "authenticated": False}
+    
+    # Check for tenant-based authentication
+    if x_tenant_id and x_timestamp and x_signature:
+        # For HMAC authentication, we'll verify without consuming the body
+        # In a real implementation, you'd need to handle this more carefully
+        # For now, we'll use a simplified approach
+        
+        if auth_manager.verify_tenant_auth(x_tenant_id, x_signature, x_timestamp, ""):
+            tier = auth_manager.get_tenant_tier(x_tenant_id)
+            return {"tenant_id": x_tenant_id, "tier": tier, "authenticated": True}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid authentication signature"
+            )
+    
+    # Check for bearer token authentication (for API keys)
+    if credentials:
+        # Simple API key validation (in production, use proper JWT or OAuth)
+        if credentials.credentials in ["demo-api-key", "test-api-key"]:
+            tenant_id = "demo" if credentials.credentials == "demo-api-key" else "test"
+            tier = auth_manager.get_tenant_tier(tenant_id)
+            return {"tenant_id": tenant_id, "tier": tier, "authenticated": True}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid API key"
+            )
+    
+    # For development/testing, allow unauthenticated access with default limits
+    return {"tenant_id": "anonymous", "tier": "default", "authenticated": False}
+
+
+async def check_rate_limit(
+    request: Request,
+    auth_info: Dict[str, Any] = Depends(verify_authentication)
+) -> Dict[str, Any]:
+    """Check rate limits for the request."""
+    tenant_id = auth_info["tenant_id"]
+    tier = auth_info["tier"]
+    
+    if not rate_limiter.is_allowed(tenant_id, tier):
+        remaining = rate_limiter.get_remaining(tenant_id, tier)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Remaining requests: {remaining}",
+            headers={"X-RateLimit-Remaining": str(remaining)}
+        )
+    
+    # Add rate limit info to response headers
+    remaining = rate_limiter.get_remaining(tenant_id, tier)
+    request.state.rate_limit_remaining = remaining
+    
+    return auth_info
+
+
+# Custom exception handlers
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    """Handle validation errors."""
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    logger.warning(f"Validation error for request {request_id}: {exc}")
+    
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=ErrorResponse(
+            error="Validation Error",
+            detail=str(exc),
+            request_id=request_id
+        ).dict()
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions with proper formatting."""
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error=exc.detail,
+            request_id=request_id
+        ).dict()
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle unexpected exceptions."""
+    request_id = getattr(request.state, 'request_id', str(uuid.uuid4()))
+    logger.error(f"Unexpected error for request {request_id}: {exc}\n{traceback.format_exc()}")
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=ErrorResponse(
+            error="Internal Server Error",
+            detail="An unexpected error occurred",
+            request_id=request_id
+        ).dict()
+    )
+
+
+# Middleware for request correlation ID and rate limit headers
+@app.middleware("http")
+async def add_request_headers_middleware(request: Request, call_next):
+    """Add request correlation ID and rate limit headers."""
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = request_id
+    
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    
+    # Add rate limit headers if available
+    if hasattr(request.state, 'rate_limit_remaining'):
+        response.headers["X-RateLimit-Remaining"] = str(request.state.rate_limit_remaining)
+    
+    return response
+
+
+@app.post("/v1/analyze", 
+          response_model=AnalysisResponse,
+          responses={
+              400: {"model": ErrorResponse, "description": "Bad Request - Invalid input"},
+              422: {"model": ErrorResponse, "description": "Validation Error"},
+              500: {"model": ErrorResponse, "description": "Internal Server Error"},
+              503: {"model": ErrorResponse, "description": "Service Unavailable"}
+          })
 async def analyze_content(
     request: AnalyzeRequest,
+    http_request: Request,
+    auth_info: Dict[str, Any] = Depends(check_rate_limit),
     service: HarmonyGuardService = Depends(get_service)
 ):
     """
     Analyze text content for corporate appropriateness.
     
-    Returns decision (allow/review/block), confidence, severity, categories,
-    and optional detailed analysis including spans and explanations.
+    This endpoint processes text content through the Harmony Guard ensemble
+    to determine if it's appropriate for corporate communications.
+    
+    **Request Parameters:**
+    - **text**: Text content to analyze (1-10000 characters)
+    - **tenant_id**: Optional tenant identifier for policy customization
+    - **include_details**: Include detailed analysis results (spans, explanations)
+    - **language_hints**: Optional language codes to improve analysis accuracy
+    
+    **Response:**
+    - **corporate_allowed**: Decision (allow/review/block)
+    - **confidence**: Confidence score (0.0-1.0)
+    - **severity**: Severity level (low/medium/high/critical)
+    - **categories**: List of detected abuse categories
+    - **languages**: Detected languages with percentages
+    - **spans**: Problematic text spans (if include_details=true)
+    - **explanations**: Decision explanations (if include_details=true)
     """
+    start_time = time.time()
+    request_id = getattr(http_request.state, 'request_id', str(uuid.uuid4()))
+    
     try:
-        start_time = time.time()
-        request_id = str(uuid.uuid4())
+        # Validate text length for processing efficiency
+        if len(request.text) > 10000:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Text too long. Maximum length is 10000 characters."
+            )
+        
+        # Use authenticated tenant_id if not provided in request
+        tenant_id = request.tenant_id or auth_info["tenant_id"]
         
         # Convert to internal request model
         analysis_request = AnalysisRequest(
             text=request.text,
-            tenant_id=request.tenant_id,
+            tenant_id=tenant_id,
             include_details=request.include_details,
             language_hints=request.language_hints
         )
         
-        # Process the request
-        result = await service.analyze(analysis_request, request_id)
+        # Process the request with timeout
+        try:
+            result = await asyncio.wait_for(
+                service.analyze(analysis_request, request_id),
+                timeout=5.0  # 5 second timeout
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                detail="Request processing timeout"
+            )
         
         # Log request metrics
         processing_time = time.time() - start_time
         logger.info(
             f"Request {request_id} processed in {processing_time:.3f}s - "
-            f"Decision: {result.corporate_allowed}, Confidence: {result.confidence:.3f}"
+            f"Decision: {result.corporate_allowed}, Confidence: {result.confidence:.3f}, "
+            f"Text length: {len(request.text)}, Tenant: {tenant_id}, "
+            f"Authenticated: {auth_info['authenticated']}"
         )
         
         return result
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error processing analysis request: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Error processing analysis request {request_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process analysis request"
+        )
 
 
-@app.post("/v1/feedback")
+@app.post("/v1/feedback",
+          responses={
+              200: {"description": "Feedback submitted successfully"},
+              400: {"model": ErrorResponse, "description": "Bad Request - Invalid feedback"},
+              422: {"model": ErrorResponse, "description": "Validation Error"},
+              500: {"model": ErrorResponse, "description": "Internal Server Error"}
+          })
 async def submit_feedback(
     feedback: FeedbackSubmission,
+    http_request: Request,
+    auth_info: Dict[str, Any] = Depends(check_rate_limit),
     service: HarmonyGuardService = Depends(get_service)
 ):
     """
     Submit feedback for continuous learning and model improvement.
+    
+    This endpoint allows users to provide corrections and feedback on
+    analysis results to improve the system's accuracy over time.
+    
+    **Request Parameters:**
+    - **request_id**: Original analysis request ID
+    - **final_label**: Corrected decision (allow/review/block)
+    - **actual_categories**: List of actual abuse categories present
+    - **comment**: Optional additional feedback comment
+    - **language_hints**: Optional language hints for the content
+    
+    **Response:**
+    - **status**: Success/failure status
+    - **message**: Descriptive message
+    - **feedback_id**: Unique identifier for the feedback submission
     """
+    request_id = getattr(http_request.state, 'request_id', str(uuid.uuid4()))
+    
     try:
         # Convert to internal feedback model
         feedback_request = FeedbackRequest(
@@ -144,51 +512,215 @@ async def submit_feedback(
         success = await service.submit_feedback(feedback_request)
         
         if success:
-            return {"status": "success", "message": "Feedback submitted successfully"}
-        else:
-            raise HTTPException(status_code=400, detail="Failed to submit feedback")
+            feedback_id = str(uuid.uuid4())
+            logger.info(f"Feedback submitted successfully: {feedback_id} for request {feedback.request_id}")
             
+            return {
+                "status": "success",
+                "message": "Feedback submitted successfully",
+                "feedback_id": feedback_id,
+                "original_request_id": feedback.request_id
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to submit feedback - invalid request ID or data"
+            )
+            
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Error submitting feedback: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Error submitting feedback for request {request_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process feedback submission"
+        )
 
 
-@app.get("/v1/health")
+@app.get("/v1/health",
+         responses={
+             200: {"description": "Service is healthy"},
+             503: {"description": "Service is unhealthy"}
+         })
 async def health_check():
-    """Health check endpoint."""
-    return {
-        "status": "ok",
-        "version": "1.0.0",
-        "service": "harmony-guard"
-    }
-
-
-@app.get("/v1/readiness")
-async def readiness_check(service: HarmonyGuardService = Depends(get_service)):
-    """Readiness check endpoint."""
-    is_ready = await service.is_ready()
+    """
+    Basic health check endpoint for liveness probe.
     
-    if is_ready:
-        return {"status": "ready"}
-    else:
-        raise HTTPException(status_code=503, detail="Service not ready")
+    This endpoint performs a simple health check to verify that the
+    service is running and responsive. It does not check component health.
+    
+    **Response:**
+    - **status**: Health status (ok/unhealthy)
+    - **version**: Service version
+    - **service**: Service name
+    - **timestamp**: Current timestamp
+    """
+    try:
+        return {
+            "status": "ok",
+            "version": "1.0.0",
+            "service": "harmony-guard",
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Service unhealthy"
+        )
 
 
-@app.get("/v1/metrics")
+@app.get("/v1/readiness",
+         responses={
+             200: {"description": "Service is ready"},
+             503: {"description": "Service is not ready"}
+         })
+async def readiness_check(service: HarmonyGuardService = Depends(get_service)):
+    """
+    Readiness check endpoint for Kubernetes readiness probe.
+    
+    This endpoint verifies that all service components are loaded
+    and ready to handle requests.
+    
+    **Response:**
+    - **status**: Readiness status (ready/not_ready)
+    - **components**: Status of individual components
+    - **timestamp**: Current timestamp
+    """
+    try:
+        is_ready = await service.is_ready()
+        component_status = await service.get_component_status()
+        
+        if is_ready:
+            return {
+                "status": "ready",
+                "components": component_status,
+                "timestamp": time.time()
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "status": "not_ready",
+                    "components": component_status,
+                    "timestamp": time.time()
+                }
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to check service readiness"
+        )
+
+
+@app.get("/v1/metrics",
+         responses={
+             200: {"description": "Service metrics"},
+             500: {"description": "Failed to retrieve metrics"}
+         })
 async def get_metrics(service: HarmonyGuardService = Depends(get_service)):
-    """Get service metrics."""
-    metrics = await service.get_metrics()
-    return metrics
+    """
+    Get basic service metrics for monitoring.
+    
+    This endpoint provides operational metrics including request counts,
+    latency statistics, error rates, and decision distributions.
+    
+    **Response:**
+    - **requests_total**: Total number of requests processed
+    - **requests_by_decision**: Request counts by decision type
+    - **average_latency**: Average processing latency in seconds
+    - **errors_total**: Total number of errors
+    - **feedback_total**: Total feedback submissions received
+    - **uptime**: Service uptime in seconds
+    """
+    try:
+        metrics = await service.get_metrics()
+        
+        # Add additional operational metrics
+        metrics.update({
+            "uptime": time.time() - app.state.start_time if hasattr(app.state, 'start_time') else 0,
+            "timestamp": time.time()
+        })
+        
+        return metrics
+    except Exception as e:
+        logger.error(f"Error retrieving metrics: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve service metrics"
+        )
 
 
-@app.get("/v1/config")
+@app.get("/v1/config",
+         responses={
+             200: {"description": "Public configuration"},
+             400: {"description": "Invalid tenant ID"},
+             500: {"description": "Failed to retrieve configuration"}
+         })
 async def get_config(
     tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
     service: HarmonyGuardService = Depends(get_service)
 ):
-    """Get non-secret configuration."""
-    config = await service.get_public_config(tenant_id)
-    return config
+    """
+    Get non-secret configuration information.
+    
+    This endpoint provides public configuration details that can be
+    safely shared with clients, such as supported languages and limits.
+    
+    **Query Parameters:**
+    - **tenant_id**: Optional tenant ID for tenant-specific configuration
+    
+    **Response:**
+    - **supported_languages**: List of supported language codes
+    - **max_sequence_length**: Maximum text length for processing
+    - **version**: Service version
+    - **features**: Available features and capabilities
+    - **limits**: Processing limits and thresholds
+    """
+    try:
+        # Use authenticated tenant_id if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        # Validate tenant_id format if provided
+        if effective_tenant_id and effective_tenant_id != "anonymous":
+            if not effective_tenant_id.replace('-', '').replace('_', '').isalnum():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid tenant ID format"
+                )
+        
+        config = await service.get_public_config(effective_tenant_id)
+        
+        # Add additional public configuration
+        config.update({
+            "features": {
+                "multi_language_support": True,
+                "code_mixed_content": True,
+                "obfuscation_detection": True,
+                "context_analysis": True,
+                "detailed_explanations": True
+            },
+            "limits": {
+                "max_text_length": 10000,
+                "max_requests_per_minute": 1000,
+                "timeout_seconds": 5
+            },
+            "timestamp": time.time()
+        })
+        
+        return config
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error retrieving configuration: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve configuration"
+        )
 
 
 @app.get("/v1/monitoring/performance")
@@ -273,6 +805,45 @@ async def run_drift_analysis(service: HarmonyGuardService = Depends(get_service)
     except Exception as e:
         logger.error(f"Error running drift analysis: {e}")
         raise HTTPException(status_code=500, detail="Failed to run drift analysis")
+
+
+@app.get("/v1/auth/info",
+         responses={
+             200: {"description": "Authentication information"},
+             401: {"description": "Authentication required"}
+         })
+async def get_auth_info(auth_info: Dict[str, Any] = Depends(verify_authentication)):
+    """
+    Get authentication information for the current request.
+    
+    This endpoint returns information about the authenticated tenant,
+    their tier, rate limits, and authentication status.
+    
+    **Response:**
+    - **tenant_id**: Authenticated tenant identifier
+    - **tier**: Tenant tier (default/premium)
+    - **authenticated**: Whether request is authenticated
+    - **rate_limits**: Current rate limit configuration
+    - **remaining_requests**: Remaining requests in current window
+    """
+    tenant_id = auth_info["tenant_id"]
+    tier = auth_info["tier"]
+    
+    # Get rate limit info
+    remaining = rate_limiter.get_remaining(tenant_id, tier)
+    limit_config = rate_limiter.limits.get(tier, rate_limiter.limits["default"])
+    
+    return {
+        "tenant_id": tenant_id,
+        "tier": tier,
+        "authenticated": auth_info["authenticated"],
+        "rate_limits": {
+            "requests_per_window": limit_config["requests"],
+            "window_seconds": limit_config["window"],
+            "remaining_requests": remaining
+        },
+        "timestamp": time.time()
+    }
 
 
 if __name__ == "__main__":

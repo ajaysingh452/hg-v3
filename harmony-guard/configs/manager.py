@@ -4,7 +4,7 @@ import yaml
 import os
 from typing import Dict, Any, Optional
 from pathlib import Path
-from ..core.interfaces import ConfigurationManagerInterface
+from core.interfaces import ConfigurationManagerInterface
 
 
 class ConfigurationManager(ConfigurationManagerInterface):

@@ -10,7 +10,7 @@ from ..core.interfaces import ConfigurationManagerInterface
 from ..core.preprocessing import TextPreprocessor
 from ..lpe.engine import LexiconPatternEngine
 from ..model.classifier import TransformerClassifier
-from ..model.intent import IntentContextLayer
+from ..intent import IntentContextLayer
 from ..model.aggregator import EnsembleAggregator
 from ..model.policy import PolicyEngine
 
@@ -81,7 +81,7 @@ class HarmonyGuardService:
     
     async def analyze(self, request: AnalysisRequest, request_id: str) -> AnalysisResponse:
         """
-        Analyze content for corporate appropriateness.
+        Analyze content for corporate appropriateness with graceful degradation.
         
         Args:
             request: Analysis request
@@ -93,52 +93,128 @@ class HarmonyGuardService:
         if not self._initialized:
             raise RuntimeError("Service not initialized")
         
+        start_time = asyncio.get_event_loop().time()
+        component_errors = []
+        
         try:
-            start_time = asyncio.get_event_loop().time()
+            # Step 1: Preprocess text (critical component)
+            try:
+                processed_text = await self.preprocessor.process(
+                    request.text, 
+                    request.language_hints
+                )
+                logger.debug(f"Request {request_id}: Text preprocessing completed")
+            except Exception as e:
+                logger.error(f"Request {request_id}: Preprocessing failed: {e}")
+                # Fallback to basic preprocessing
+                processed_text = self._fallback_preprocessing(request.text)
+                component_errors.append("preprocessing")
             
-            # Step 1: Preprocess text
-            processed_text = await self.preprocessor.process(
-                request.text, 
-                request.language_hints
-            )
+            # Step 2: Run ensemble components in parallel with error handling
+            lpe_result = None
+            classifier_result = None
             
-            # Step 2: Run ensemble components in parallel
-            lpe_task = self.lpe_engine.analyze(processed_text)
-            classifier_task = self.classifier.predict(processed_text)
+            try:
+                # Run components with individual error handling
+                lpe_task = self._safe_component_call(
+                    self.lpe_engine.analyze, processed_text, "LPE"
+                )
+                classifier_task = self._safe_component_call(
+                    self.classifier.predict, processed_text, "Classifier"
+                )
+                
+                results = await asyncio.gather(
+                    lpe_task, classifier_task, return_exceptions=True
+                )
+                
+                lpe_result = results[0] if not isinstance(results[0], Exception) else None
+                classifier_result = results[1] if not isinstance(results[1], Exception) else None
+                
+                if lpe_result is None:
+                    component_errors.append("lpe")
+                    lpe_result = self._fallback_lpe_result()
+                
+                if classifier_result is None:
+                    component_errors.append("classifier")
+                    classifier_result = self._fallback_classifier_result()
+                
+                logger.debug(f"Request {request_id}: Ensemble components completed")
+                
+            except Exception as e:
+                logger.error(f"Request {request_id}: Ensemble components failed: {e}")
+                lpe_result = self._fallback_lpe_result()
+                classifier_result = self._fallback_classifier_result()
+                component_errors.extend(["lpe", "classifier"])
             
-            lpe_result, classifier_result = await asyncio.gather(
-                lpe_task, classifier_task
-            )
+            # Step 3: Context analysis with error handling
+            try:
+                context_result = await self.intent_layer.analyze_context(
+                    processed_text, lpe_result, classifier_result
+                )
+                logger.debug(f"Request {request_id}: Context analysis completed")
+            except Exception as e:
+                logger.error(f"Request {request_id}: Context analysis failed: {e}")
+                context_result = self._fallback_context_result()
+                component_errors.append("intent")
             
-            # Step 3: Context analysis
-            context_result = await self.intent_layer.analyze_context(
-                processed_text, lpe_result, classifier_result
-            )
+            # Step 4: Aggregate results with error handling
+            try:
+                aggregated_result = await self.aggregator.aggregate(
+                    lpe_result, classifier_result, context_result
+                )
+                logger.debug(f"Request {request_id}: Result aggregation completed")
+            except Exception as e:
+                logger.error(f"Request {request_id}: Aggregation failed: {e}")
+                aggregated_result = self._fallback_aggregation(
+                    lpe_result, classifier_result, context_result
+                )
+                component_errors.append("aggregator")
             
-            # Step 4: Aggregate results
-            aggregated_result = await self.aggregator.aggregate(
-                lpe_result, classifier_result, context_result
-            )
-            
-            # Step 5: Apply policy rules
-            final_result = await self.policy_engine.apply_policy(
-                aggregated_result, request.tenant_id
-            )
+            # Step 5: Apply policy rules with error handling
+            try:
+                final_result = await self.policy_engine.apply_policy(
+                    aggregated_result, request.tenant_id
+                )
+                logger.debug(f"Request {request_id}: Policy application completed")
+            except Exception as e:
+                logger.error(f"Request {request_id}: Policy application failed: {e}")
+                final_result = self._fallback_policy_application(aggregated_result)
+                component_errors.append("policy")
             
             # Step 6: Build response
             response = self._build_response(
-                final_result, processed_text, request.include_details
+                final_result, processed_text, request.include_details, component_errors
             )
             
             # Update metrics
             processing_time = asyncio.get_event_loop().time() - start_time
-            self._update_metrics(response.corporate_allowed, processing_time)
+            self._update_metrics(response.corporate_allowed, processing_time, component_errors)
+            
+            # Log completion with component status
+            logger.info(
+                f"Request {request_id} completed in {processing_time:.3f}s - "
+                f"Decision: {response.corporate_allowed}, Confidence: {response.confidence:.3f}, "
+                f"Errors: {component_errors or 'none'}"
+            )
             
             return response
             
         except Exception as e:
-            logger.error(f"Error analyzing content: {e}")
+            logger.error(f"Request {request_id}: Critical error in analysis pipeline: {e}")
             self.metrics["errors_total"] += 1
+            
+            # Last resort fallback
+            return self._emergency_fallback_response(request.text, request.include_details)
+    
+    async def _safe_component_call(self, component_method, *args, component_name: str):
+        """Safely call a component method with timeout and error handling."""
+        try:
+            return await asyncio.wait_for(component_method(*args), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning(f"{component_name} component timed out")
+            raise
+        except Exception as e:
+            logger.error(f"{component_name} component failed: {e}")
             raise
     
     async def submit_feedback(self, feedback: FeedbackRequest) -> bool:
@@ -166,6 +242,39 @@ class HarmonyGuardService:
     async def is_ready(self) -> bool:
         """Check if service is ready to handle requests."""
         return self._initialized
+    
+    async def get_component_status(self) -> Dict[str, str]:
+        """Get status of individual service components."""
+        status = {}
+        
+        try:
+            status["preprocessor"] = "ready" if self.preprocessor else "not_loaded"
+            status["lpe_engine"] = "ready" if self.lpe_engine else "not_loaded"
+            status["classifier"] = "ready" if self.classifier else "not_loaded"
+            status["intent_layer"] = "ready" if self.intent_layer else "not_loaded"
+            status["aggregator"] = "ready" if self.aggregator else "not_loaded"
+            status["policy_engine"] = "ready" if self.policy_engine else "not_loaded"
+            
+            # Check if components are actually functional
+            if self._initialized:
+                # Could add more detailed health checks here
+                for component_name in status:
+                    if status[component_name] == "ready":
+                        # Verify component is actually functional
+                        component = getattr(self, component_name, None)
+                        if component and hasattr(component, 'is_healthy'):
+                            try:
+                                is_healthy = await component.is_healthy()
+                                if not is_healthy:
+                                    status[component_name] = "unhealthy"
+                            except Exception:
+                                status[component_name] = "error"
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"Error getting component status: {e}")
+            return {"error": str(e)}
     
     async def get_metrics(self) -> Dict[str, Any]:
         """Get service metrics."""
@@ -330,7 +439,8 @@ class HarmonyGuardService:
         self, 
         result, 
         processed_text, 
-        include_details: bool
+        include_details: bool,
+        component_errors: List[str] = None
     ) -> AnalysisResponse:
         """Build API response from analysis result."""
         
@@ -355,13 +465,134 @@ class HarmonyGuardService:
             response.explanations = result.explanation_traces
             response.normalized_preview = processed_text.normalized_text
             response.policy_trace = getattr(result, 'policy_trace', [])
+            
+            # Add component error information if present
+            if component_errors:
+                if response.explanations is None:
+                    response.explanations = []
+                response.explanations.append(
+                    f"Component errors encountered: {', '.join(component_errors)}"
+                )
         
         return response
     
-    def _update_metrics(self, decision: DecisionType, processing_time: float):
-        """Update service metrics."""
+    def _fallback_preprocessing(self, text: str):
+        """Fallback preprocessing when main preprocessor fails."""
+        from ..core.models import ProcessedText, LanguageDetection
+        
+        return ProcessedText(
+            original_text=text,
+            normalized_text=text.lower().strip(),
+            detected_languages=[LanguageDetection(code="en", confidence=0.5, percentage=100.0)],
+            tokens=text.split(),
+            transliterations={},
+            obfuscation_map={},
+            pii_masked=False
+        )
+    
+    def _fallback_lpe_result(self):
+        """Fallback LPE result when LPE engine fails."""
+        from ..core.models import LPEResult
+        
+        return LPEResult(
+            matched_spans=[],
+            categories=[],
+            confidence_scores={},
+            rule_traces=["LPE engine unavailable - using fallback"]
+        )
+    
+    def _fallback_classifier_result(self):
+        """Fallback classifier result when classifier fails."""
+        from ..core.models import ClassifierResult
+        
+        return ClassifierResult(
+            category_probabilities={},
+            corporate_decision_prob={"allow": 0.7, "review": 0.2, "block": 0.1},
+            severity_scores={"low": 0.8, "medium": 0.2, "high": 0.0, "critical": 0.0},
+            attention_spans=[]
+        )
+    
+    def _fallback_context_result(self):
+        """Fallback context result when intent layer fails."""
+        from ..core.models import ContextResult, DecisionType
+        
+        return ContextResult(
+            context_modifiers={},
+            safe_context_detected={},
+            recommended_action=DecisionType.REVIEW
+        )
+    
+    def _fallback_aggregation(self, lpe_result, classifier_result, context_result):
+        """Fallback aggregation when aggregator fails."""
+        from ..core.models import AggregatedResult, DecisionType, SeverityLevel
+        
+        # Conservative fallback - default to review
+        return AggregatedResult(
+            final_decision=DecisionType.REVIEW,
+            confidence_score=0.5,
+            category_scores={},
+            severity_level=SeverityLevel.MEDIUM,
+            explanation_traces=["Fallback aggregation used - manual review recommended"],
+            consolidated_spans=[]
+        )
+    
+    def _fallback_policy_application(self, aggregated_result):
+        """Fallback policy application when policy engine fails."""
+        # Add fallback policy trace
+        explanation_traces = aggregated_result.explanation_traces + [
+            "Policy engine unavailable - using conservative defaults"
+        ]
+        
+        # Conservative policy - escalate uncertain cases
+        if aggregated_result.confidence_score > 0.8:
+            final_decision = DecisionType.BLOCK
+        else:
+            final_decision = DecisionType.REVIEW
+        
+        from ..core.models import AggregatedResult
+        
+        result = AggregatedResult(
+            final_decision=final_decision,
+            confidence_score=aggregated_result.confidence_score,
+            category_scores=aggregated_result.category_scores,
+            severity_level=aggregated_result.severity_level,
+            explanation_traces=explanation_traces,
+            consolidated_spans=aggregated_result.consolidated_spans
+        )
+        
+        setattr(result, 'policy_trace', ["Fallback policy applied"])
+        return result
+    
+    def _emergency_fallback_response(self, text: str, include_details: bool):
+        """Emergency fallback response when entire pipeline fails."""
+        from ..core.models import AnalysisResponse, DecisionType, SeverityLevel
+        
+        return AnalysisResponse(
+            corporate_allowed=DecisionType.REVIEW,
+            confidence=0.0,
+            severity=SeverityLevel.MEDIUM,
+            categories=[],
+            languages=[{"code": "unknown", "pct": 100.0}],
+            spans=[] if include_details else None,
+            explanations=["System error - manual review required"] if include_details else None,
+            normalized_preview=text[:100] + "..." if len(text) > 100 else text if include_details else None,
+            policy_trace=["Emergency fallback applied"] if include_details else None
+        )
+    
+    def _update_metrics(self, decision: DecisionType, processing_time: float, component_errors: List[str] = None):
+        """Update service metrics with component error tracking."""
         self.metrics["requests_total"] += 1
         self.metrics["requests_by_decision"][decision.value] += 1
+        
+        # Track component errors
+        if component_errors:
+            if "component_errors" not in self.metrics:
+                self.metrics["component_errors"] = {}
+            
+            for component in component_errors:
+                if component not in self.metrics["component_errors"]:
+                    self.metrics["component_errors"][component] = 0
+                self.metrics["component_errors"][component] += 1
         
         # Update average latency (simple moving average)
         current_avg = self.metrics["average_latency"]

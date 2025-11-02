@@ -1,0 +1,61 @@
+# Tech Corp tenant-specific policy configuration
+policy_profile:
+  name: "tech_corp_policy"
+  version: "1.1"
+  
+  # More lenient thresholds for tech discussions
+  block_thresholds:
+    "threat/violence":
+      medium: 0.6
+      high: 0.4
+      critical: 0.2
+    "hate/targeted group":
+      medium: 0.7
+      high: 0.5
+      critical: 0.3
+    "obscenity/profanity":
+      medium: 0.9  # More lenient for casual tech discussions
+      high: 0.8
+      critical: 0.6
+    "insult/harassment":
+      medium: 0.85
+      high: 0.7
+      critical: 0.5
+  
+  # Additional safe contexts for tech environment
+  safe_contexts:
+    - "code_review"
+    - "technical_discussion"
+    - "debugging_session"
+    - "security_analysis"
+  
+  # Department-specific overrides
+  department_overrides:
+    engineering:
+      allow_technical_language: true
+      review_threshold_adjustment: -0.1
+    security:
+      allow_threat_analysis: true
+      allow_vulnerability_discussion: true
+      review_threshold_adjustment: -0.2
+    hr:
+      allow_sensitive_discussions: true
+      review_threshold_adjustment: -0.05
+  
+  # Additional hard rules for tech environment
+  hard_rules:
+    - category: "threat/violence"
+      severity: "critical"
+      action: "block"
+      override_allowed: false
+    - category: "hate/targeted group"
+      severity: "critical" 
+      action: "block"
+      override_allowed: false
+    - category: "spam/scam"
+      severity: "high"
+      action: "block"
+      override_allowed: true  # Allow security team to override for analysis
+  
+  # Custom lexicon overlay for tech terms
+  tenant_lexicon_overlay: "tech_corp_lexicon.yaml"

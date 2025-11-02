@@ -3,17 +3,20 @@
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
-from sklearn.model_selection import cross_val_score
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import log_loss
 import logging
+import math
 
 from .interfaces import EnsembleAggregatorInterface
 from .models import (
     LPEResult, ClassifierResult, ContextResult, AggregatedResult,
     ProblemSpan, DecisionType, SeverityLevel, AbuseCategory
 )
-from ..configs.manager import ConfigurationManager
+from .decision_logic import (
+    AdvancedSpanRanker, AdaptiveDecisionMaker, EnsembleWeightManager,
+    DecisionContext, RankingMethod
+)
+from .explanation import ExplanationGenerator, ExplanationLevel
+from configs.manager import ConfigurationManager
 
 logger = logging.getLogger(__name__)
 
@@ -83,15 +86,21 @@ class TemperatureScaler:
             calibrated_probs = self._softmax(logits / temp)
             # Handle binary classification case
             if calibrated_probs.shape[1] == 2:
-                loss = log_loss(labels, calibrated_probs[:, 1])
+                loss = self._log_loss(labels, calibrated_probs[:, 1])
             else:
-                loss = log_loss(labels, calibrated_probs)
+                loss = self._log_loss(labels, calibrated_probs)
             
             if loss < best_loss:
                 best_loss = loss
                 best_temp = temp
         
         return best_temp
+    
+    def _log_loss(self, y_true: np.ndarray, y_prob: np.ndarray) -> float:
+        """Simple log loss implementation."""
+        epsilon = 1e-15
+        y_prob = np.clip(y_prob, epsilon, 1 - epsilon)
+        return -np.mean(y_true * np.log(y_prob) + (1 - y_true) * np.log(1 - y_prob))
     
     @staticmethod
     def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -138,19 +147,19 @@ class EnsembleWeightOptimizer:
         component_names = list(component_predictions.keys())
         X = np.column_stack([component_predictions[name] for name in component_names])
         
-        # Use logistic regression to learn optimal weights
-        lr = LogisticRegression(fit_intercept=False, random_state=42)
+        # Simple weight optimization using correlation with true labels
+        correlations = {}
+        for i, component_name in enumerate(component_names):
+            correlation = np.corrcoef(X[:, i], true_labels)[0, 1]
+            correlations[component_name] = max(0, correlation)  # Only positive correlations
         
-        # Cross-validation to get robust weight estimates
-        cv_scores = cross_val_score(lr, X, true_labels, cv=self.cv_folds, scoring='neg_log_loss')
-        logger.info(f"Cross-validation log loss: {-cv_scores.mean():.4f} (+/- {cv_scores.std() * 2:.4f})")
-        
-        # Fit on full data to get final weights
-        lr.fit(X, true_labels)
-        raw_weights = lr.coef_[0] if lr.coef_.ndim > 1 else lr.coef_
-        
-        # Normalize weights to sum to 1
-        normalized_weights = np.abs(raw_weights) / np.sum(np.abs(raw_weights))
+        # Normalize correlations to get weights
+        total_correlation = sum(correlations.values())
+        if total_correlation > 0:
+            normalized_weights = np.array([correlations[name] / total_correlation for name in component_names])
+        else:
+            # Equal weights if no positive correlations
+            normalized_weights = np.ones(len(component_names)) / len(component_names)
         
         self.optimal_weights = {
             component_names[i]: float(normalized_weights[i]) 
@@ -275,6 +284,10 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
         self.temperature_scaler = TemperatureScaler()
         self.weight_optimizer = EnsembleWeightOptimizer()
         self.span_consolidator = SpanConsolidator()
+        self.span_ranker = AdvancedSpanRanker()
+        self.adaptive_decision_maker = AdaptiveDecisionMaker()
+        self.weight_manager = EnsembleWeightManager()
+        self.explanation_generator = ExplanationGenerator()
         
         # Load configuration
         self._load_config()
@@ -303,6 +316,10 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
                 max_spans=span_config.get('max_spans', 10)
             )
             
+            # Initialize span ranker with configured method
+            ranking_method = span_config.get('ranking_method', 'hybrid')
+            self.span_ranker = AdvancedSpanRanker(RankingMethod(ranking_method))
+            
             logger.info("Ensemble configuration loaded successfully")
             
         except Exception as e:
@@ -311,13 +328,16 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
             self.weights = {'lpe': 0.4, 'classifier': 0.5, 'intent': 0.1}
             self.confidence_minimum = 0.6
             self.review_threshold = 0.7
-            self.block_threshold = 0.85    
- 
-   def aggregate(
+            self.block_threshold = 0.85
+    
+    def aggregate(
         self,
         lpe_result: LPEResult,
         classifier_result: ClassifierResult,
-        context_result: ContextResult
+        context_result: ContextResult,
+        original_text: str = "",
+        language_confidence: float = 1.0,
+        primary_language: str = "en"
     ) -> AggregatedResult:
         """
         Combine and calibrate outputs from all ensemble components.
@@ -326,11 +346,23 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
             lpe_result: Result from lexicon engine
             classifier_result: Result from ML classifier
             context_result: Result from context analysis
+            original_text: Original input text for context
+            language_confidence: Confidence in language detection
+            primary_language: Primary detected language
             
         Returns:
             AggregatedResult with final decision and explanations
         """
         try:
+            # Create decision context
+            decision_context = DecisionContext(
+                text_length=len(original_text),
+                language_confidence=language_confidence,
+                primary_language=primary_language,
+                has_code_mixing=self._detect_code_mixing(original_text),
+                obfuscation_detected=self._detect_obfuscation(lpe_result)
+            )
+            
             # Extract component predictions
             component_scores = self._extract_component_scores(
                 lpe_result, classifier_result, context_result
@@ -341,27 +373,44 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
                 component_scores, context_result
             )
             
-            # Combine scores using ensemble weights
-            final_scores = self._combine_scores(adjusted_scores)
+            # Get adaptive weights based on performance
+            adaptive_weights = self.weight_manager.get_adaptive_weights(self.weights)
             
-            # Make final decision
-            final_decision = self._make_decision(final_scores)
+            # Combine scores using adaptive ensemble weights
+            final_scores = self._combine_scores(adjusted_scores, adaptive_weights)
             
-            # Calculate overall confidence
-            confidence_score = self._calculate_confidence(final_scores, final_decision)
+            # Make adaptive decision
+            base_thresholds = {
+                'review': self.review_threshold,
+                'block': self.block_threshold
+            }
+            
+            final_decision, confidence_score, final_scores = self.adaptive_decision_maker.make_adaptive_decision(
+                final_scores, decision_context, base_thresholds
+            )
             
             # Determine severity level
             severity_level = self._determine_severity(final_scores)
             
-            # Consolidate spans
-            consolidated_spans = self._consolidate_spans(
-                lpe_result, classifier_result, context_result
+            # Consolidate and rank spans
+            consolidated_spans = self._consolidate_and_rank_spans(
+                lpe_result, classifier_result, context_result, decision_context
             )
             
-            # Generate explanations
-            explanation_traces = self._generate_explanations(
-                lpe_result, classifier_result, context_result, 
-                final_scores, final_decision
+            # Generate explanations using the explanation generator
+            explanation_traces = self.explanation_generator.generate_explanation(
+                lpe_result, classifier_result, context_result,
+                AggregatedResult(
+                    final_decision=final_decision,
+                    confidence_score=confidence_score,
+                    category_scores=final_scores,
+                    severity_level=severity_level,
+                    explanation_traces=[],
+                    consolidated_spans=consolidated_spans
+                ),
+                decision_context=decision_context,
+                explanation_level=ExplanationLevel.DETAILED,
+                component_weights=adaptive_weights
             )
             
             return AggregatedResult(
@@ -443,8 +492,26 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
         
         return adjusted_scores
     
-    def _combine_scores(self, component_scores: Dict[str, Dict[str, float]]) -> Dict[str, float]:
+    def _detect_code_mixing(self, text: str) -> bool:
+        """Detect if text contains code-mixing."""
+        # Simple heuristic: check for mixed scripts or language patterns
+        # This is a simplified implementation
+        has_latin = any(ord(c) < 128 for c in text if c.isalpha())
+        has_non_latin = any(ord(c) > 128 for c in text if c.isalpha())
+        return has_latin and has_non_latin
+    
+    def _detect_obfuscation(self, lpe_result: LPEResult) -> bool:
+        """Detect if obfuscation techniques were found."""
+        # Check if any rule traces mention obfuscation
+        obfuscation_keywords = ['leet', 'obfuscation', 'elongation', 'homoglyph']
+        return any(keyword in trace.lower() for trace in lpe_result.rule_traces 
+                  for keyword in obfuscation_keywords)
+
+    def _combine_scores(self, component_scores: Dict[str, Dict[str, float]], weights: Dict[str, float] = None) -> Dict[str, float]:
         """Combine component scores using ensemble weights."""
+        if weights is None:
+            weights = self.weights
+            
         final_scores = {}
         
         # Get all categories
@@ -459,7 +526,7 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
             
             for component_name, scores in component_scores.items():
                 if category in scores:
-                    weight = self.weights.get(component_name, 0.0)
+                    weight = weights.get(component_name, 0.0)
                     weighted_score += scores[category] * weight
                     total_weight += weight
             
@@ -525,19 +592,26 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
         else:
             return SeverityLevel.LOW
     
-    def _consolidate_spans(
+    def _consolidate_and_rank_spans(
         self,
         lpe_result: LPEResult,
         classifier_result: ClassifierResult,
-        context_result: ContextResult
+        context_result: ContextResult,
+        decision_context: DecisionContext
     ) -> List[ProblemSpan]:
-        """Consolidate spans from all components."""
+        """Consolidate and rank spans from all components."""
         span_lists = [
             lpe_result.matched_spans,
             classifier_result.attention_spans
         ]
         
-        return self.span_consolidator.consolidate_spans(span_lists)
+        # First consolidate overlapping spans
+        consolidated_spans = self.span_consolidator.consolidate_spans(span_lists)
+        
+        # Then rank the consolidated spans
+        ranked_spans = self.span_ranker.rank_spans(consolidated_spans, decision_context)
+        
+        return ranked_spans
     
     def _generate_explanations(
         self,
@@ -545,7 +619,8 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
         classifier_result: ClassifierResult,
         context_result: ContextResult,
         final_scores: Dict[str, float],
-        final_decision: DecisionType
+        final_decision: DecisionType,
+        decision_context: DecisionContext = None
     ) -> List[str]:
         """Generate human-readable explanations for the decision."""
         explanations = []
@@ -645,3 +720,80 @@ class EnsembleAggregator(EnsembleAggregatorInterface):
         )
         
         logger.info("Calibration training completed")
+    
+    def update_component_performance(
+        self,
+        component_predictions: Dict[str, bool],
+        component_confidences: Dict[str, float]
+    ) -> None:
+        """
+        Update component performance for adaptive weight management.
+        
+        Args:
+            component_predictions: Dictionary of {component_name: prediction_correct}
+            component_confidences: Dictionary of {component_name: confidence_score}
+        """
+        for component_name, correct in component_predictions.items():
+            confidence = component_confidences.get(component_name, 0.5)
+            self.weight_manager.update_performance(component_name, correct, confidence)
+    
+    def get_performance_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get performance summary for all components."""
+        return self.weight_manager.get_performance_summary()
+    
+    def generate_detailed_explanation(
+        self,
+        lpe_result: LPEResult,
+        classifier_result: ClassifierResult,
+        context_result: ContextResult,
+        aggregated_result: AggregatedResult,
+        decision_context: DecisionContext = None,
+        explanation_level: ExplanationLevel = ExplanationLevel.BASIC
+    ) -> List[str]:
+        """
+        Generate detailed explanation for a specific result.
+        
+        Args:
+            lpe_result: Result from lexicon engine
+            classifier_result: Result from ML classifier
+            context_result: Result from context analysis
+            aggregated_result: Final aggregated result
+            decision_context: Context information
+            explanation_level: Level of detail for explanation
+            
+        Returns:
+            List of explanation strings
+        """
+        return self.explanation_generator.generate_explanation(
+            lpe_result, classifier_result, context_result,
+            aggregated_result, decision_context, explanation_level,
+            self.weight_manager.get_adaptive_weights(self.weights)
+        )
+    
+    def get_attribution_report(
+        self,
+        lpe_result: LPEResult,
+        classifier_result: ClassifierResult,
+        context_result: ContextResult,
+        aggregated_result: AggregatedResult
+    ) -> Dict[str, float]:
+        """
+        Get attribution report showing component contributions.
+        
+        Args:
+            lpe_result: Result from lexicon engine
+            classifier_result: Result from ML classifier
+            context_result: Result from context analysis
+            aggregated_result: Final aggregated result
+            
+        Returns:
+            Dictionary mapping component names to attribution scores
+        """
+        decision_trace = self.explanation_generator._create_decision_trace(
+            lpe_result, classifier_result, context_result,
+            aggregated_result, self.weight_manager.get_adaptive_weights(self.weights)
+        )
+        
+        return self.explanation_generator.generate_attribution_report(
+            decision_trace, aggregated_result
+        )
