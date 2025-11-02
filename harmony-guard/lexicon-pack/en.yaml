@@ -1,0 +1,75 @@
+# English lexicon for content moderation
+language: "en"
+version: "1.0"
+
+entries:
+  # Insult/Harassment
+  - terms: ["idiot", "stupid", "moron", "dumb", "fool"]
+    category: "insult/harassment"
+    severity: "medium"
+    weight: 0.8
+    
+  - terms: ["bastard", "bitch", "asshole"]
+    category: "insult/harassment" 
+    severity: "high"
+    weight: 0.9
+    
+  # Obscenity/Profanity
+  - terms: ["damn", "hell", "crap"]
+    category: "obscenity/profanity"
+    severity: "low"
+    weight: 0.6
+    
+  - terms: ["fuck", "shit", "fucking"]
+    category: "obscenity/profanity"
+    severity: "high"
+    weight: 0.95
+    
+  # Hate/Targeted Groups
+  - terms: ["racist", "bigot", "nazi"]
+    category: "hate/targeted group"
+    severity: "high"
+    weight: 0.9
+    
+  # Threat/Violence
+  - terms: ["kill", "murder", "die", "death"]
+    category: "threat/violence"
+    severity: "critical"
+    weight: 0.95
+    context_required: true  # Needs context analysis
+    
+  - terms: ["beat up", "destroy", "eliminate"]
+    category: "threat/violence"
+    severity: "high"
+    weight: 0.85
+    
+  # Sexual Content
+  - terms: ["sex", "sexual", "porn", "nude"]
+    category: "sexual content"
+    severity: "medium"
+    weight: 0.7
+    context_required: true
+    
+# Morphological variants and patterns
+patterns:
+  # Elongation patterns
+  - pattern: "f+u+c+k+"
+    base_term: "fuck"
+    category: "obscenity/profanity"
+    severity: "high"
+    
+  - pattern: "s+h+i+t+"
+    base_term: "shit"
+    category: "obscenity/profanity"
+    severity: "high"
+    
+  # Leet speak patterns
+  - pattern: "@ss"
+    base_term: "ass"
+    category: "obscenity/profanity"
+    severity: "medium"
+    
+  - pattern: "b!tch"
+    base_term: "bitch"
+    category: "insult/harassment"
+    severity: "high"

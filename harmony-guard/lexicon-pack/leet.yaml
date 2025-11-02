@@ -1,0 +1,83 @@
+# Leet speak substitution tables
+version: "1.0"
+
+# Character substitutions for leet speak
+substitutions:
+  # Numbers to letters
+  "0": ["o", "O"]
+  "1": ["i", "I", "l", "L"]
+  "3": ["e", "E"]
+  "4": ["a", "A"]
+  "5": ["s", "S"]
+  "7": ["t", "T"]
+  "8": ["b", "B"]
+  
+  # Symbols to letters
+  "@": ["a", "A"]
+  "!": ["i", "I"]
+  "$": ["s", "S"]
+  "+": ["t", "T"]
+  "()": ["o", "O"]
+  "|-|": ["h", "H"]
+  "|_|": ["u", "U"]
+  "\/": ["v", "V"]
+  "\/\/": ["w", "W"]
+  "><": ["x", "X"]
+  
+# Common leet patterns
+patterns:
+  # Profanity patterns
+  - leet: "f*ck"
+    normal: "fuck"
+    category: "obscenity/profanity"
+    
+  - leet: "sh!t"
+    normal: "shit"
+    category: "obscenity/profanity"
+    
+  - leet: "@ss"
+    normal: "ass"
+    category: "obscenity/profanity"
+    
+  - leet: "b!tch"
+    normal: "bitch"
+    category: "insult/harassment"
+    
+  - leet: "d@mn"
+    normal: "damn"
+    category: "obscenity/profanity"
+    
+  # Insults
+  - leet: "!d!0t"
+    normal: "idiot"
+    category: "insult/harassment"
+    
+  - leet: "m0r0n"
+    normal: "moron"
+    category: "insult/harassment"
+    
+  - leet: "5tup!d"
+    normal: "stupid"
+    category: "insult/harassment"
+
+# Phonetic substitutions
+phonetic:
+  # Common phonetic obfuscations
+  "ph": "f"
+  "ck": "k"
+  "qu": "kw"
+  "x": "ks"
+  
+# Elongation patterns (repeated characters)
+elongation:
+  min_repetition: 3
+  max_compression: 2
+  patterns:
+    - "a+": "aa"
+    - "e+": "ee"
+    - "i+": "ii"
+    - "o+": "oo"
+    - "u+": "uu"
+    - "f+": "ff"
+    - "s+": "ss"
+    - "h+": "hh"

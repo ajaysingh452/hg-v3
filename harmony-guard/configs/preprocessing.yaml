@@ -1,0 +1,58 @@
+# Text preprocessing configuration
+preprocessing:
+  # Language identification settings
+  language_detection:
+    confidence_threshold: 0.7
+    segment_length: 50
+    fallback_to_ngram: true
+    supported_languages:
+      - "hi"  # Hindi
+      - "en"  # English
+      - "bn"  # Bengali
+      - "te"  # Telugu
+      - "ta"  # Tamil
+      - "mr"  # Marathi
+      - "gu"  # Gujarati
+      - "kn"  # Kannada
+      - "ml"  # Malayalam
+      - "or"  # Odia
+      - "pa"  # Punjabi
+      - "as"  # Assamese
+      - "hi-Latn"  # Hinglish (Hindi in Latin script)
+  
+  # Text normalization settings
+  normalization:
+    unicode_form: "NFKC"
+    strip_zero_width: true
+    fold_diacritics: true
+    normalize_punctuation: true
+    compress_repeated_chars: true
+    max_char_repetition: 3
+  
+  # Transliteration settings
+  transliteration:
+    romanized_to_native: true
+    native_to_romanized: true
+    confidence_threshold: 0.6
+    generate_variants: true
+  
+  # Obfuscation handling
+  obfuscation:
+    leet_speak_detection: true
+    phonetic_normalization: true
+    elongation_detection: true
+    homoglyph_normalization: true
+  
+  # Tokenization settings
+  tokenization:
+    emoji_aware: true
+    script_aware: true
+    preserve_spans: true
+    
+  # PII masking settings
+  pii_masking:
+    enabled: false  # Optional feature
+    mask_emails: true
+    mask_phones: true
+    mask_ids: true
+    mask_character: "*"

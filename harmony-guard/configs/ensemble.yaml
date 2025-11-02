@@ -1,0 +1,36 @@
+# Ensemble configuration for Harmony Guard
+ensemble:
+  weights:
+    lpe: 0.4
+    classifier: 0.5
+    intent: 0.1
+  
+  calibration:
+    temperature_scaling: true
+    temperature: 1.2
+  
+  thresholds:
+    confidence_minimum: 0.6
+    review_threshold: 0.7
+    block_threshold: 0.85
+  
+  span_consolidation:
+    overlap_threshold: 0.3
+    max_spans: 10
+    ranking_method: "confidence_weighted"
+
+# Component-specific settings
+lpe:
+  fuzzy_matching: true
+  fuzzy_threshold: 0.8
+  morphological_variants: true
+  
+classifier:
+  model_name: "xlm-roberta-base"
+  max_sequence_length: 512
+  batch_size: 8
+  
+intent:
+  negation_scope: 5
+  quotation_detection: true
+  safe_context_boost: 0.2

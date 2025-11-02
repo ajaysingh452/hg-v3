@@ -1,0 +1,68 @@
+# Default corporate policy configuration
+policy_profile:
+  name: "default_corporate"
+  version: "1.0"
+  
+  # Block thresholds by category and severity
+  block_thresholds:
+    "threat/violence":
+      medium: 0.7
+      high: 0.5
+      critical: 0.3
+    "hate/targeted group":
+      medium: 0.8
+      high: 0.6
+      critical: 0.4
+    "obscenity/profanity":
+      medium: 0.85
+      high: 0.7
+      critical: 0.5
+    "insult/harassment":
+      medium: 0.8
+      high: 0.65
+      critical: 0.45
+    "sexual content":
+      medium: 0.8
+      high: 0.6
+      critical: 0.4
+    "bullying/taunting":
+      medium: 0.85
+      high: 0.7
+      critical: 0.5
+    "self-harm encouragement":
+      medium: 0.7
+      high: 0.5
+      critical: 0.3
+    "spam/scam":
+      medium: 0.9
+      high: 0.8
+      critical: 0.6
+  
+  # Safe contexts that allow otherwise flagged content
+  safe_contexts:
+    - "hr_reporting"
+    - "legal_documentation" 
+    - "educational_content"
+    - "policy_discussion"
+  
+  # Department-specific overrides
+  department_overrides:
+    hr:
+      allow_sensitive_discussions: true
+      review_threshold_adjustment: -0.1
+    legal:
+      allow_policy_examples: true
+      review_threshold_adjustment: -0.15
+    security:
+      allow_threat_analysis: true
+      
+  # Hard rules that always apply
+  hard_rules:
+    - category: "threat/violence"
+      severity: "critical"
+      action: "block"
+      override_allowed: false
+    - category: "hate/targeted group" 
+      severity: "critical"
+      action: "block"
+      override_allowed: false

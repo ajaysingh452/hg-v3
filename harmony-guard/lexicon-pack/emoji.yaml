@@ -1,0 +1,94 @@
+# Emoji sentiment and abuse mapping
+version: "1.0"
+
+# Explicit abuse/offensive emojis
+offensive_emojis:
+  - emoji: "🖕"
+    category: "insult/harassment"
+    severity: "high"
+    weight: 0.9
+    description: "middle finger"
+    
+  - emoji: "🍆"
+    category: "sexual content"
+    severity: "medium"
+    weight: 0.7
+    context_required: true
+    description: "eggplant (sexual connotation)"
+    
+  - emoji: "🍑"
+    category: "sexual content"
+    severity: "medium"
+    weight: 0.7
+    context_required: true
+    description: "peach (sexual connotation)"
+    
+  - emoji: "💩"
+    category: "obscenity/profanity"
+    severity: "low"
+    weight: 0.5
+    description: "pile of poo"
+
+# Anger/violence related emojis
+anger_emojis:
+  - emoji: "😡"
+    category: "threat/violence"
+    severity: "low"
+    weight: 0.4
+    description: "angry face"
+    
+  - emoji: "🤬"
+    category: "obscenity/profanity"
+    severity: "medium"
+    weight: 0.6
+    description: "face with symbols over mouth"
+    
+  - emoji: "💀"
+    category: "threat/violence"
+    severity: "medium"
+    weight: 0.6
+    context_required: true
+    description: "skull"
+    
+  - emoji: "🔪"
+    category: "threat/violence"
+    severity: "high"
+    weight: 0.8
+    description: "kitchen knife"
+    
+  - emoji: "🔫"
+    category: "threat/violence"
+    severity: "high"
+    weight: 0.8
+    description: "pistol"
+
+# Combination patterns (emoji + text context)
+combination_patterns:
+  - pattern: "🖕.*you"
+    category: "insult/harassment"
+    severity: "high"
+    weight: 0.95
+    
+  - pattern: "kill.*💀"
+    category: "threat/violence"
+    severity: "critical"
+    weight: 0.95
+    
+  - pattern: "🍆.*🍑"
+    category: "sexual content"
+    severity: "high"
+    weight: 0.85
+
+# Kaomoji patterns
+kaomoji:
+  - pattern: "凸"
+    category: "insult/harassment"
+    severity: "medium"
+    weight: 0.7
+    description: "middle finger kaomoji"
+    
+  - pattern: "ಠ_ಠ"
+    category: "insult/harassment"
+    severity: "low"
+    weight: 0.3
+    description: "disapproval face"

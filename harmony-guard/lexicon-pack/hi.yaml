@@ -1,0 +1,63 @@
+# Hindi lexicon for content moderation
+language: "hi"
+version: "1.0"
+
+entries:
+  # Insult/Harassment (Hindi)
+  - terms: ["बेवकूफ", "मूर्ख", "गधा", "उल्लू"]
+    category: "insult/harassment"
+    severity: "medium"
+    weight: 0.8
+    
+  - terms: ["कमीना", "हरामी", "साला"]
+    category: "insult/harassment"
+    severity: "high"
+    weight: 0.9
+    
+  # Obscenity/Profanity (Hindi)
+  - terms: ["भैंस", "कुत्ता", "सुअर"]
+    category: "obscenity/profanity"
+    severity: "medium"
+    weight: 0.7
+    
+  - terms: ["रंडी", "भोसड़ी", "मादरचोद"]
+    category: "obscenity/profanity"
+    severity: "critical"
+    weight: 0.95
+    
+  # Romanized Hindi (Hinglish)
+  - terms: ["bewakoof", "gadha", "ullu"]
+    category: "insult/harassment"
+    severity: "medium"
+    weight: 0.8
+    script: "romanized"
+    
+  - terms: ["kamina", "harami", "saala"]
+    category: "insult/harassment"
+    severity: "high"
+    weight: 0.9
+    script: "romanized"
+    
+  - terms: ["madarchod", "bhosadi", "randi"]
+    category: "obscenity/profanity"
+    severity: "critical"
+    weight: 0.95
+    script: "romanized"
+
+# Transliteration mappings
+transliteration:
+  romanized_to_devanagari:
+    "madarchod": "मादरचोद"
+    "bhosadi": "भोसड़ी"
+    "randi": "रंडी"
+    "kamina": "कमीना"
+    "harami": "हरामी"
+    "bewakoof": "बेवकूफ"
+    "gadha": "गधा"
+    
+# Morphological variants
+variants:
+  - base: "मादरचोद"
+    variants: ["मदरचोद", "मादरचोद्", "madarchod", "madarchod"]
+  - base: "कमीना"
+    variants: ["कमीने", "kamina", "kameena"]
