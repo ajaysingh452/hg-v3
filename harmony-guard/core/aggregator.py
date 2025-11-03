@@ -16,7 +16,7 @@ from .decision_logic import (
     DecisionContext, RankingMethod
 )
 from .explanation import ExplanationGenerator, ExplanationLevel
-from configs.manager import ConfigurationManager
+from ..configs.manager import ConfigurationManager
 
 logger = logging.getLogger(__name__)
 

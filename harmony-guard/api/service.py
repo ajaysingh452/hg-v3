@@ -2,19 +2,25 @@
 
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from ..core.models import AnalysisRequest, AnalysisResponse, FeedbackRequest, DecisionType, SeverityLevel
 from ..core.interfaces import ConfigurationManagerInterface
 from ..core.preprocessing import TextPreprocessor
+from ..core.metrics import metrics
+from ..core.logging import get_logger
+from ..core.feedback import FeedbackManager
+from ..core.active_learning import ActiveLearningPipeline
+from ..core.model_retraining import DriftDetectionEngine, PerformanceMonitor, ModelRetrainingManager
 from ..lpe.engine import LexiconPatternEngine
 from ..model.classifier import TransformerClassifier
 from ..intent import IntentContextLayer
 from ..model.aggregator import EnsembleAggregator
 from ..model.policy import PolicyEngine
 
-
+# Use structured logger
+app_logger = get_logger(__name__)
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +41,11 @@ class HarmonyGuardService:
         self.intent_layer = None
         self.aggregator = None
         self.policy_engine = None
+        self.feedback_manager = None
+        self.active_learning = None
+        self.performance_monitor = None
+        self.drift_detector = None
+        self.retraining_manager = None
         
         # Service metrics
         self.metrics = {
@@ -44,6 +55,9 @@ class HarmonyGuardService:
             "errors_total": 0,
             "feedback_total": 0
         }
+        
+        # Request cache for feedback correlation
+        self.request_cache = {}
         
         self._initialized = False
     
@@ -63,6 +77,11 @@ class HarmonyGuardService:
             self.intent_layer = IntentContextLayer(ensemble_config.get("intent", {}))
             self.aggregator = EnsembleAggregator(ensemble_config)
             self.policy_engine = PolicyEngine(self.config_manager)
+            self.feedback_manager = FeedbackManager()
+            self.active_learning = ActiveLearningPipeline(self.feedback_manager)
+            self.performance_monitor = PerformanceMonitor()
+            self.drift_detector = DriftDetectionEngine(self.feedback_manager, self.performance_monitor)
+            self.retraining_manager = ModelRetrainingManager(self.drift_detector)
             
             # Initialize each component
             await self.preprocessor.initialize()
@@ -71,6 +90,20 @@ class HarmonyGuardService:
             await self.intent_layer.initialize()
             await self.aggregator.initialize()
             await self.policy_engine.initialize()
+            await self.feedback_manager.initialize()
+            
+            # Set initial component health metrics
+            metrics.set_component_health("preprocessor", True)
+            metrics.set_component_health("lpe_engine", True)
+            metrics.set_component_health("classifier", True)
+            metrics.set_component_health("intent_layer", True)
+            metrics.set_component_health("aggregator", True)
+            metrics.set_component_health("policy_engine", True)
+            metrics.set_component_health("feedback_manager", True)
+            metrics.set_component_health("active_learning", True)
+            metrics.set_component_health("performance_monitor", True)
+            metrics.set_component_health("drift_detector", True)
+            metrics.set_component_health("retraining_manager", True)
             
             self._initialized = True
             logger.info("Harmony Guard service initialized successfully")
@@ -98,14 +131,26 @@ class HarmonyGuardService:
         
         try:
             # Step 1: Preprocess text (critical component)
+            preprocessing_start = asyncio.get_event_loop().time()
             try:
                 processed_text = await self.preprocessor.process(
                     request.text, 
                     request.language_hints
                 )
+                preprocessing_time = asyncio.get_event_loop().time() - preprocessing_start
+                metrics.record_component_performance("preprocessor", preprocessing_time)
+                
+                # Record language detection metrics
+                for lang in processed_text.detected_languages:
+                    metrics.record_language_detection(lang.code, lang.confidence)
+                
                 logger.debug(f"Request {request_id}: Text preprocessing completed")
             except Exception as e:
-                logger.error(f"Request {request_id}: Preprocessing failed: {e}")
+                preprocessing_time = asyncio.get_event_loop().time() - preprocessing_start
+                metrics.record_component_performance("preprocessor", preprocessing_time)
+                metrics.record_component_error("preprocessor", type(e).__name__)
+                
+                app_logger.log_component_error("preprocessor", type(e).__name__, str(e))
                 # Fallback to basic preprocessing
                 processed_text = self._fallback_preprocessing(request.text)
                 component_errors.append("preprocessing")
@@ -186,6 +231,24 @@ class HarmonyGuardService:
                 final_result, processed_text, request.include_details, component_errors
             )
             
+            # Cache request data for potential feedback correlation
+            self.request_cache[request_id] = {
+                'original_text': request.text,
+                'decision': response.corporate_allowed.value,
+                'confidence': response.confidence,
+                'tenant_id': request.tenant_id,
+                'timestamp': datetime.utcnow(),
+                'categories': response.categories
+            }
+            
+            # Analyze for active learning (async, don't wait)
+            if self.active_learning:
+                asyncio.create_task(
+                    self.active_learning.analyze_prediction(
+                        response, request_id, request.text, request.tenant_id
+                    )
+                )
+            
             # Update metrics
             processing_time = asyncio.get_event_loop().time() - start_time
             self._update_metrics(response.corporate_allowed, processing_time, component_errors)
@@ -208,12 +271,22 @@ class HarmonyGuardService:
     
     async def _safe_component_call(self, component_method, *args, component_name: str):
         """Safely call a component method with timeout and error handling."""
+        start_time = asyncio.get_event_loop().time()
         try:
-            return await asyncio.wait_for(component_method(*args), timeout=3.0)
+            result = await asyncio.wait_for(component_method(*args), timeout=3.0)
+            duration = asyncio.get_event_loop().time() - start_time
+            metrics.record_component_performance(component_name.lower(), duration)
+            return result
         except asyncio.TimeoutError:
+            duration = asyncio.get_event_loop().time() - start_time
+            metrics.record_component_performance(component_name.lower(), duration)
+            metrics.record_component_error(component_name.lower(), "timeout")
             logger.warning(f"{component_name} component timed out")
             raise
         except Exception as e:
+            duration = asyncio.get_event_loop().time() - start_time
+            metrics.record_component_performance(component_name.lower(), duration)
+            metrics.record_component_error(component_name.lower(), type(e).__name__)
             logger.error(f"{component_name} component failed: {e}")
             raise
     
@@ -228,9 +301,19 @@ class HarmonyGuardService:
             Success status
         """
         try:
-            # Store feedback for future model training
-            # In a real implementation, this would write to a database
-            logger.info(f"Received feedback for request {feedback.request_id}")
+            # Get cached request data for correlation
+            cached_data = self.request_cache.get(feedback.request_id, {})
+            
+            # Submit feedback through feedback manager
+            feedback_id = await self.feedback_manager.submit_feedback(
+                feedback=feedback,
+                tenant_id=cached_data.get('tenant_id'),
+                original_text=cached_data.get('original_text'),
+                original_decision=cached_data.get('decision'),
+                confidence_score=cached_data.get('confidence')
+            )
+            
+            logger.info(f"Processed feedback {feedback_id} for request {feedback.request_id}")
             
             self.metrics["feedback_total"] += 1
             return True
@@ -254,6 +337,11 @@ class HarmonyGuardService:
             status["intent_layer"] = "ready" if self.intent_layer else "not_loaded"
             status["aggregator"] = "ready" if self.aggregator else "not_loaded"
             status["policy_engine"] = "ready" if self.policy_engine else "not_loaded"
+            status["feedback_manager"] = "ready" if self.feedback_manager else "not_loaded"
+            status["active_learning"] = "ready" if self.active_learning else "not_loaded"
+            status["performance_monitor"] = "ready" if self.performance_monitor else "not_loaded"
+            status["drift_detector"] = "ready" if self.drift_detector else "not_loaded"
+            status["retraining_manager"] = "ready" if self.retraining_manager else "not_loaded"
             
             # Check if components are actually functional
             if self._initialized:
@@ -424,6 +512,214 @@ class HarmonyGuardService:
         
         return recommendations
     
+    async def get_feedback_analytics(
+        self, 
+        tenant_id: Optional[str] = None,
+        days: int = 30
+    ) -> Dict[str, Any]:
+        """Get feedback analytics for monitoring and improvement."""
+        if not self.feedback_manager:
+            return {"error": "Feedback manager not initialized"}
+        
+        try:
+            analytics = await self.feedback_manager.get_feedback_analytics(tenant_id, days)
+            
+            return {
+                "total_feedback": analytics.total_feedback_count,
+                "feedback_by_decision": analytics.feedback_by_decision,
+                "feedback_by_category": analytics.feedback_by_category,
+                "feedback_by_language": analytics.feedback_by_language,
+                "correction_rate": analytics.correction_rate,
+                "average_confidence_delta": analytics.average_confidence_delta,
+                "recent_trend": analytics.recent_feedback_trend,
+                "analysis_period_days": days,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting feedback analytics: {e}")
+            return {"error": str(e)}
+    
+    async def get_recent_feedback(
+        self, 
+        tenant_id: Optional[str] = None,
+        limit: int = 100
+    ) -> Dict[str, Any]:
+        """Get recent feedback records."""
+        if not self.feedback_manager:
+            return {"error": "Feedback manager not initialized"}
+        
+        try:
+            records = await self.feedback_manager.get_recent_feedback(tenant_id, limit)
+            
+            # Convert to API format
+            feedback_data = []
+            for record in records:
+                feedback_data.append({
+                    "feedback_id": record.feedback_id,
+                    "request_id": record.request_id,
+                    "timestamp": record.timestamp.isoformat(),
+                    "final_label": record.final_label,
+                    "actual_categories": record.actual_categories,
+                    "comment": record.comment,
+                    "language_hints": record.language_hints,
+                    "tenant_id": record.tenant_id,
+                    "confidence_score": record.confidence_score,
+                    "original_decision": record.original_decision
+                })
+            
+            return {
+                "feedback_records": feedback_data,
+                "total_count": len(feedback_data),
+                "limit": limit,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting recent feedback: {e}")
+            return {"error": str(e)}
+    
+    async def get_review_queue_status(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get active learning review queue status."""
+        if not self.active_learning:
+            return {"error": "Active learning not initialized"}
+        
+        try:
+            return await self.active_learning.get_review_queue_status(tenant_id)
+        except Exception as e:
+            logger.error(f"Error getting review queue status: {e}")
+            return {"error": str(e)}
+    
+    async def get_pending_reviews(
+        self, 
+        limit: int = 50,
+        priority_filter: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Get pending review items for human reviewers."""
+        if not self.active_learning:
+            return []
+        
+        try:
+            return await self.active_learning.get_pending_reviews(
+                limit=limit,
+                priority_filter=priority_filter,
+                tenant_id=tenant_id
+            )
+        except Exception as e:
+            logger.error(f"Error getting pending reviews: {e}")
+            return []
+    
+    async def submit_review_feedback(
+        self, 
+        review_id: str,
+        corrected_decision: str,
+        corrected_categories: List[str],
+        reviewer_comment: Optional[str] = None
+    ) -> bool:
+        """Submit feedback from human review."""
+        if not self.active_learning:
+            return False
+        
+        try:
+            return await self.active_learning.process_review_feedback(
+                review_id=review_id,
+                corrected_decision=corrected_decision,
+                corrected_categories=corrected_categories,
+                reviewer_comment=reviewer_comment
+            )
+        except Exception as e:
+            logger.error(f"Error submitting review feedback: {e}")
+            return False
+    
+    async def run_comprehensive_drift_analysis(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Run comprehensive drift analysis."""
+        if not self.drift_detector:
+            return {"error": "Drift detector not initialized"}
+        
+        try:
+            return await self.drift_detector.run_drift_analysis(tenant_id)
+        except Exception as e:
+            logger.error(f"Error running drift analysis: {e}")
+            return {"error": str(e)}
+    
+    async def get_drift_alerts_detailed(
+        self, 
+        hours: int = 24,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Get detailed drift alerts."""
+        if not self.drift_detector:
+            return {"error": "Drift detector not initialized"}
+        
+        try:
+            alerts = await self.drift_detector.get_drift_alerts(hours, tenant_id)
+            
+            return {
+                "alerts": [
+                    {
+                        "alert_id": alert.alert_id,
+                        "drift_type": alert.drift_type.value,
+                        "severity": alert.severity.value,
+                        "metric_name": alert.metric_name,
+                        "current_value": alert.current_value,
+                        "baseline_value": alert.baseline_value,
+                        "drift_score": alert.drift_score,
+                        "description": alert.description,
+                        "timestamp": alert.timestamp.isoformat(),
+                        "statistical_test": alert.statistical_test,
+                        "p_value": alert.p_value
+                    }
+                    for alert in alerts
+                ],
+                "total_alerts": len(alerts),
+                "critical_alerts": len([a for a in alerts if a.severity.value == "critical"]),
+                "high_alerts": len([a for a in alerts if a.severity.value == "high"]),
+                "hours_analyzed": hours,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting drift alerts: {e}")
+            return {"error": str(e)}
+    
+    async def check_retraining_triggers(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Check if model retraining should be triggered."""
+        if not self.retraining_manager:
+            return {"error": "Retraining manager not initialized"}
+        
+        try:
+            job_id = await self.retraining_manager.check_retraining_triggers(tenant_id)
+            
+            if job_id:
+                return {
+                    "retraining_triggered": True,
+                    "job_id": job_id,
+                    "message": "Model retraining job created",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+            else:
+                return {
+                    "retraining_triggered": False,
+                    "message": "No retraining triggers detected",
+                    "timestamp": datetime.utcnow().isoformat()
+                }
+                
+        except Exception as e:
+            logger.error(f"Error checking retraining triggers: {e}")
+            return {"error": str(e)}
+    
+    async def get_retraining_status(self, tenant_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get model retraining status."""
+        if not self.retraining_manager:
+            return {"error": "Retraining manager not initialized"}
+        
+        try:
+            return await self.retraining_manager.get_retraining_status(tenant_id)
+        except Exception as e:
+            logger.error(f"Error getting retraining status: {e}")
+            return {"error": str(e)}
+    
     async def shutdown(self):
         """Shutdown service and cleanup resources."""
         logger.info("Shutting down Harmony Guard service...")
@@ -431,6 +727,9 @@ class HarmonyGuardService:
         # Cleanup components
         if self.classifier:
             await self.classifier.shutdown()
+        
+        if self.feedback_manager:
+            await self.feedback_manager.shutdown()
         
         self._initialized = False
         logger.info("Harmony Guard service shutdown complete")

@@ -7,9 +7,10 @@ from typing import Dict, List, Optional, Tuple, Any
 import logging
 from pathlib import Path
 
-from core.models import ProcessedText, ClassifierResult, ProblemSpan, AbuseCategory, SeverityLevel
-from core.interfaces import TransformerClassifierInterface
-from model.monitoring import ModelPerformanceMonitor
+from ..core.models import ProcessedText, ClassifierResult, ProblemSpan, AbuseCategory, SeverityLevel
+from ..core.interfaces import TransformerClassifierInterface
+from ..core.metrics import metrics
+from .monitoring import ModelPerformanceMonitor
 
 
 logger = logging.getLogger(__name__)

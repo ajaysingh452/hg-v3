@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 import logging
 
-from core.models import AbuseCategory, SeverityLevel, DecisionType
+from ..core.models import AbuseCategory, SeverityLevel, DecisionType
 
 
 logger = logging.getLogger(__name__)

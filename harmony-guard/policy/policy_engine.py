@@ -3,8 +3,8 @@
 from typing import Dict, Optional, Any
 import logging
 
-from core.interfaces import PolicyEngineInterface
-from core.models import AggregatedResult, DecisionType
+from ..core.interfaces import PolicyEngineInterface
+from ..core.models import AggregatedResult, DecisionType
 from .config_loader import PolicyConfigLoader
 from .rule_engine import PolicyRuleEngine, PolicyDecision
 from .audit_logger import PolicyAuditLogger

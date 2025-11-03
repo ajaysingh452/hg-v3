@@ -217,8 +217,8 @@ class TextNormalizer:
         """Build punctuation normalization map."""
         return {
             # Quotation marks
-            '"': '"', '"': '"', ''': "'", ''': "'",
-            '«': '"', '»': '"', '‹': "'", '›': "'",
+            '\u201c': '"', '\u201d': '"', '\u2018': "'", '\u2019': "'",
+            '\u00ab': '"', '\u00bb': '"', '\u2039': "'", '\u203a': "'",
             
             # Dashes and hyphens
             '–': '-', '—': '-', '―': '-', '‒': '-',
@@ -227,7 +227,7 @@ class TextNormalizer:
             '…': '...',
             
             # Apostrophes
-            ''': "'", '`': "'",
+            '\u2019': "'", '`': "'",
             
             # Spaces
             '\u00A0': ' ',  # Non-breaking space

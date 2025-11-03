@@ -18,15 +18,19 @@ from collections import defaultdict, deque
 
 from ..core.models import AnalysisRequest, AnalysisResponse, FeedbackRequest, DecisionType, SeverityLevel
 from ..configs.manager import ConfigurationManager
+from ..core.metrics import metrics, MetricsMiddleware, create_metrics_endpoint
+from ..core.logging import configure_logging, LoggingMiddleware, DEFAULT_LOGGING_CONFIG
+from ..core.health import HealthMonitor, SystemResourceChecker, ModelChecker, GracefulShutdownHandler
 from .service import HarmonyGuardService
 
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure structured logging
+app_logger = configure_logging(DEFAULT_LOGGING_CONFIG)
 logger = logging.getLogger(__name__)
 
 # Global service instance
 harmony_service = None
+health_monitor = None
+shutdown_handler = None
 
 # Authentication and rate limiting
 security = HTTPBearer(auto_error=False)
@@ -113,17 +117,41 @@ auth_manager = AuthenticationManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan management."""
-    global harmony_service
+    global harmony_service, health_monitor, shutdown_handler
     
     # Startup
     logger.info("Starting Harmony Guard service...")
     app.state.start_time = time.time()
     
     try:
+        # Initialize configuration and service
         config_manager = ConfigurationManager()
         harmony_service = HarmonyGuardService(config_manager)
         await harmony_service.initialize()
+        
+        # Initialize health monitoring
+        health_monitor = HealthMonitor({
+            "check_interval": 30,
+            "failure_threshold": 3,
+            "degraded_threshold": 2
+        })
+        
+        # Add health checkers
+        health_monitor.add_checker(SystemResourceChecker(
+            cpu_threshold=85.0,
+            memory_threshold=85.0,
+            disk_threshold=90.0
+        ))
+        health_monitor.add_checker(ModelChecker(harmony_service))
+        
+        # Start health monitoring
+        await health_monitor.start_monitoring()
+        
+        # Initialize graceful shutdown handler
+        shutdown_handler = GracefulShutdownHandler(health_monitor, harmony_service)
+        
         logger.info("Harmony Guard service initialized successfully")
+        
     except Exception as e:
         logger.error(f"Failed to initialize service: {e}")
         raise
@@ -132,12 +160,21 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down Harmony Guard service...")
-    if harmony_service:
-        try:
-            await harmony_service.shutdown()
-            logger.info("Service shutdown completed successfully")
-        except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+    
+    try:
+        if shutdown_handler:
+            await shutdown_handler.initiate_shutdown()
+        else:
+            # Fallback shutdown
+            if health_monitor:
+                await health_monitor.stop_monitoring()
+            if harmony_service:
+                await harmony_service.shutdown()
+        
+        logger.info("Service shutdown completed successfully")
+        
+    except Exception as e:
+        logger.error(f"Error during shutdown: {e}")
 
 
 # Create FastAPI app
@@ -177,11 +214,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add logging middleware
+logging_middleware = LoggingMiddleware(app_logger)
+app.middleware("http")(logging_middleware)
+
+# Add metrics middleware
+metrics_middleware = MetricsMiddleware(metrics)
+app.middleware("http")(metrics_middleware)
+
 
 # Pydantic models for API with validation
 class AnalyzeRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=10000, description="Text content to analyze")
-    tenant_id: Optional[str] = Field(None, regex=r'^[a-zA-Z0-9_-]+$', description="Tenant identifier")
+    tenant_id: Optional[str] = Field(None, pattern=r'^[a-zA-Z0-9_-]+$', description="Tenant identifier")
     include_details: bool = Field(False, description="Include detailed analysis results")
     language_hints: Optional[List[str]] = Field(None, description="Language hints for better analysis")
     
@@ -298,6 +343,10 @@ async def check_rate_limit(
     
     if not rate_limiter.is_allowed(tenant_id, tier):
         remaining = rate_limiter.get_remaining(tenant_id, tier)
+        
+        # Record rate limit hit
+        metrics.record_rate_limit_hit(tenant_id, tier)
+        
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=f"Rate limit exceeded. Remaining requests: {remaining}",
@@ -444,13 +493,32 @@ async def analyze_content(
                 detail="Request processing timeout"
             )
         
-        # Log request metrics
+        # Log request metrics and record in Prometheus
         processing_time = time.time() - start_time
-        logger.info(
-            f"Request {request_id} processed in {processing_time:.3f}s - "
-            f"Decision: {result.corporate_allowed}, Confidence: {result.confidence:.3f}, "
-            f"Text length: {len(request.text)}, Tenant: {tenant_id}, "
-            f"Authenticated: {auth_info['authenticated']}"
+        
+        # Record decision metrics
+        languages = [lang["code"] for lang in result.languages] if result.languages else ["unknown"]
+        metrics.record_decision(result.corporate_allowed.value, languages, result.confidence, tenant_id)
+        
+        # Record category-specific confidence scores
+        if result.categories:
+            primary_language = languages[0] if languages else "unknown"
+            for category in result.categories:
+                metrics.record_category_confidence(category, result.corporate_allowed.value, primary_language, result.confidence)
+        
+        # Store tenant_id in request state for middleware
+        http_request.state.tenant_id = tenant_id
+        
+        # Log analysis request with structured logging
+        app_logger.log_analysis_request(
+            text_length=len(request.text),
+            languages=[lang["code"] for lang in result.languages] if result.languages else ["unknown"],
+            decision=result.corporate_allowed.value,
+            confidence=result.confidence,
+            duration=processing_time,
+            tenant_id=tenant_id,
+            authenticated=auth_info['authenticated'],
+            categories=result.categories or []
         )
         
         return result
@@ -513,7 +581,21 @@ async def submit_feedback(
         
         if success:
             feedback_id = str(uuid.uuid4())
-            logger.info(f"Feedback submitted successfully: {feedback_id} for request {feedback.request_id}")
+            
+            # Record feedback metrics
+            feedback_type = "correction" if feedback.final_label != "allow" else "confirmation"
+            metrics.record_feedback(feedback_type, "unknown", feedback.final_label)
+            
+            # Log feedback with structured logging
+            app_logger.log_feedback(
+                original_decision="unknown",  # We don't have the original decision
+                corrected_decision=feedback.final_label,
+                feedback_type=feedback_type,
+                feedback_id=feedback_id,
+                original_request_id=feedback.request_id,
+                categories=feedback.actual_categories,
+                comment=feedback.comment
+            )
             
             return {
                 "status": "success",
@@ -544,24 +626,31 @@ async def submit_feedback(
          })
 async def health_check():
     """
-    Basic health check endpoint for liveness probe.
+    Liveness probe endpoint for Kubernetes.
     
-    This endpoint performs a simple health check to verify that the
+    This endpoint performs a basic health check to verify that the
     service is running and responsive. It does not check component health.
     
     **Response:**
-    - **status**: Health status (ok/unhealthy)
+    - **status**: Health status (alive/dead)
     - **version**: Service version
     - **service**: Service name
     - **timestamp**: Current timestamp
+    - **uptime**: Service uptime in seconds
     """
     try:
-        return {
-            "status": "ok",
-            "version": "1.0.0",
-            "service": "harmony-guard",
-            "timestamp": time.time()
-        }
+        if health_monitor:
+            status_info = await health_monitor.get_liveness_status()
+            return status_info
+        else:
+            # Fallback if health monitor not initialized
+            return {
+                "status": "alive",
+                "version": "1.0.0",
+                "service": "harmony-guard",
+                "timestamp": time.time(),
+                "uptime_seconds": time.time() - app.state.start_time if hasattr(app.state, 'start_time') else 0
+            }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
         raise HTTPException(
@@ -575,37 +664,61 @@ async def health_check():
              200: {"description": "Service is ready"},
              503: {"description": "Service is not ready"}
          })
-async def readiness_check(service: HarmonyGuardService = Depends(get_service)):
+async def readiness_check():
     """
-    Readiness check endpoint for Kubernetes readiness probe.
+    Readiness probe endpoint for Kubernetes.
     
     This endpoint verifies that all service components are loaded
-    and ready to handle requests.
+    and ready to handle requests. It performs comprehensive health
+    checks of critical components.
     
     **Response:**
     - **status**: Readiness status (ready/not_ready)
     - **components**: Status of individual components
     - **timestamp**: Current timestamp
+    - **ready**: Boolean readiness flag
+    - **unhealthy_components**: List of unhealthy components
     """
     try:
-        is_ready = await service.is_ready()
-        component_status = await service.get_component_status()
-        
-        if is_ready:
-            return {
-                "status": "ready",
-                "components": component_status,
-                "timestamp": time.time()
-            }
+        if health_monitor:
+            readiness_status = await health_monitor.get_readiness_status()
+            
+            if readiness_status["ready"]:
+                return readiness_status
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=readiness_status
+                )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail={
-                    "status": "not_ready",
-                    "components": component_status,
-                    "timestamp": time.time()
-                }
-            )
+            # Fallback readiness check
+            if harmony_service:
+                is_ready = await harmony_service.is_ready()
+                component_status = await harmony_service.get_component_status()
+                
+                if is_ready:
+                    return {
+                        "status": "ready",
+                        "components": component_status,
+                        "timestamp": time.time(),
+                        "ready": True
+                    }
+                else:
+                    raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail={
+                            "status": "not_ready",
+                            "components": component_status,
+                            "timestamp": time.time(),
+                            "ready": False
+                        }
+                    )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Service not initialized"
+                )
+                
     except HTTPException:
         raise
     except Exception as e:
@@ -807,6 +920,384 @@ async def run_drift_analysis(service: HarmonyGuardService = Depends(get_service)
         raise HTTPException(status_code=500, detail="Failed to run drift analysis")
 
 
+@app.get("/v1/feedback/analytics")
+async def get_feedback_analytics(
+    tenant_id: Optional[str] = None,
+    days: int = 30,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get feedback analytics for monitoring and continuous improvement.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+        days: Number of days to analyze (default: 30, max: 365)
+    
+    Returns feedback analytics including correction rates, category distributions,
+    and trends over time.
+    """
+    try:
+        if days < 1 or days > 365:
+            raise HTTPException(status_code=400, detail="Days must be between 1 and 365")
+        
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        analytics = await service.get_feedback_analytics(effective_tenant_id, days)
+        return analytics
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting feedback analytics: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve feedback analytics")
+
+
+@app.get("/v1/feedback/recent")
+async def get_recent_feedback(
+    tenant_id: Optional[str] = None,
+    limit: int = 100,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get recent feedback records for review and analysis.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+        limit: Maximum number of records to return (default: 100, max: 1000)
+    
+    Returns recent feedback submissions with metadata.
+    """
+    try:
+        if limit < 1 or limit > 1000:
+            raise HTTPException(status_code=400, detail="Limit must be between 1 and 1000")
+        
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        feedback_data = await service.get_recent_feedback(effective_tenant_id, limit)
+        return feedback_data
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting recent feedback: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve recent feedback")
+
+
+@app.get("/v1/active-learning/queue-status")
+async def get_review_queue_status(
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get active learning review queue status and statistics.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+    
+    Returns review queue statistics, pipeline metrics, and pending items preview.
+    """
+    try:
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        status = await service.get_review_queue_status(effective_tenant_id)
+        return status
+    except Exception as e:
+        logger.error(f"Error getting review queue status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve review queue status")
+
+
+@app.get("/v1/active-learning/pending-reviews")
+async def get_pending_reviews(
+    limit: int = 50,
+    priority: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get pending review items for human reviewers.
+    
+    Args:
+        limit: Maximum number of items to return (default: 50, max: 200)
+        priority: Filter by priority level (low/medium/high/critical)
+        tenant_id: Optional tenant ID filter
+    
+    Returns list of pending review items with prediction details.
+    """
+    try:
+        if limit < 1 or limit > 200:
+            raise HTTPException(status_code=400, detail="Limit must be between 1 and 200")
+        
+        if priority and priority not in ["low", "medium", "high", "critical"]:
+            raise HTTPException(status_code=400, detail="Invalid priority level")
+        
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        reviews = await service.get_pending_reviews(
+            limit=limit,
+            priority_filter=priority,
+            tenant_id=effective_tenant_id
+        )
+        
+        return {
+            "pending_reviews": reviews,
+            "total_count": len(reviews),
+            "filters": {
+                "limit": limit,
+                "priority": priority,
+                "tenant_id": effective_tenant_id
+            },
+            "timestamp": time.time()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting pending reviews: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve pending reviews")
+
+
+class ReviewFeedbackSubmission(BaseModel):
+    review_id: str = Field(..., description="Review item ID")
+    corrected_decision: str = Field(..., description="Corrected decision")
+    corrected_categories: List[str] = Field(..., description="Corrected abuse categories")
+    reviewer_comment: Optional[str] = Field(None, max_length=1000, description="Reviewer comment")
+    
+    @validator('corrected_decision')
+    def validate_corrected_decision(cls, v):
+        valid_decisions = {'allow', 'review', 'block'}
+        if v not in valid_decisions:
+            raise ValueError(f'Invalid decision: {v}. Must be one of {valid_decisions}')
+        return v
+    
+    @validator('corrected_categories')
+    def validate_corrected_categories(cls, v):
+        valid_categories = {
+            'insult/harassment', 'obscenity/profanity', 'hate/targeted group',
+            'threat/violence', 'sexual content', 'bullying/taunting',
+            'self-harm encouragement', 'spam/scam'
+        }
+        for category in v:
+            if category not in valid_categories:
+                raise ValueError(f'Invalid category: {category}')
+        return v
+
+
+@app.post("/v1/active-learning/submit-review")
+async def submit_review_feedback(
+    review_feedback: ReviewFeedbackSubmission,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Submit feedback from human review for active learning.
+    
+    This endpoint allows human reviewers to provide corrections for
+    low-confidence predictions, which will be integrated into the
+    continuous learning pipeline.
+    
+    **Request Parameters:**
+    - **review_id**: Review item identifier
+    - **corrected_decision**: Corrected decision (allow/review/block)
+    - **corrected_categories**: List of actual abuse categories
+    - **reviewer_comment**: Optional reviewer comment
+    
+    **Response:**
+    - **status**: Success/failure status
+    - **message**: Descriptive message
+    - **review_id**: Review item ID
+    """
+    try:
+        success = await service.submit_review_feedback(
+            review_id=review_feedback.review_id,
+            corrected_decision=review_feedback.corrected_decision,
+            corrected_categories=review_feedback.corrected_categories,
+            reviewer_comment=review_feedback.reviewer_comment
+        )
+        
+        if success:
+            return {
+                "status": "success",
+                "message": "Review feedback submitted successfully",
+                "review_id": review_feedback.review_id
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Failed to submit review feedback - invalid review ID or data"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error submitting review feedback: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to process review feedback"
+        )
+
+
+@app.get("/v1/model-retraining/drift-analysis")
+async def run_comprehensive_drift_analysis(
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Run comprehensive drift analysis using statistical tests.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+    
+    Returns comprehensive drift analysis including statistical tests,
+    alerts, and recommendations for model retraining.
+    """
+    try:
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        analysis = await service.run_comprehensive_drift_analysis(effective_tenant_id)
+        return analysis
+    except Exception as e:
+        logger.error(f"Error running comprehensive drift analysis: {e}")
+        raise HTTPException(status_code=500, detail="Failed to run drift analysis")
+
+
+@app.get("/v1/model-retraining/drift-alerts")
+async def get_detailed_drift_alerts(
+    hours: int = 24,
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get detailed drift alerts with statistical information.
+    
+    Args:
+        hours: Number of hours to look back (default: 24, max: 168)
+        tenant_id: Optional tenant ID filter
+    
+    Returns detailed drift alerts with statistical test results.
+    """
+    try:
+        if hours < 1 or hours > 168:  # Max 1 week
+            raise HTTPException(status_code=400, detail="Hours must be between 1 and 168")
+        
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        alerts = await service.get_drift_alerts_detailed(hours, effective_tenant_id)
+        return alerts
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting detailed drift alerts: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve drift alerts")
+
+
+@app.post("/v1/model-retraining/check-triggers")
+async def check_retraining_triggers(
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Check if model retraining should be triggered based on current conditions.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+    
+    Returns information about whether retraining was triggered and why.
+    """
+    try:
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        result = await service.check_retraining_triggers(effective_tenant_id)
+        return result
+    except Exception as e:
+        logger.error(f"Error checking retraining triggers: {e}")
+        raise HTTPException(status_code=500, detail="Failed to check retraining triggers")
+
+
+@app.get("/v1/model-retraining/status")
+async def get_retraining_status(
+    tenant_id: Optional[str] = None,
+    auth_info: Dict[str, Any] = Depends(verify_authentication),
+    service: HarmonyGuardService = Depends(get_service)
+):
+    """
+    Get model retraining job status and history.
+    
+    Args:
+        tenant_id: Optional tenant ID filter
+    
+    Returns recent retraining jobs with their status and metrics.
+    """
+    try:
+        # Use authenticated tenant if not provided
+        effective_tenant_id = tenant_id or auth_info["tenant_id"]
+        
+        status_info = await service.get_retraining_status(effective_tenant_id)
+        return status_info
+    except Exception as e:
+        logger.error(f"Error getting retraining status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve retraining status")
+
+
+@app.get("/metrics",
+         responses={
+             200: {"description": "Prometheus metrics"},
+         })
+async def prometheus_metrics():
+    """
+    Prometheus metrics endpoint.
+    
+    Returns metrics in Prometheus text format for scraping by monitoring systems.
+    """
+    return create_metrics_endpoint()()
+
+
+@app.get("/v1/health/detailed",
+         responses={
+             200: {"description": "Detailed health status"},
+             500: {"description": "Failed to get health status"}
+         })
+async def detailed_health_status():
+    """
+    Detailed health status endpoint for monitoring dashboards.
+    
+    This endpoint provides comprehensive health information including
+    component status, performance metrics, and historical data.
+    
+    **Response:**
+    - **timestamp**: Current timestamp
+    - **overall_status**: Overall system health
+    - **components**: Detailed component health information
+    - **recent_checks**: Results of recent health checks
+    """
+    try:
+        if health_monitor:
+            detailed_status = await health_monitor.get_detailed_status()
+            return detailed_status
+        else:
+            return {
+                "error": "Health monitoring not available",
+                "timestamp": time.time()
+            }
+    except Exception as e:
+        logger.error(f"Failed to get detailed health status: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve detailed health status"
+        )
+
+
 @app.get("/v1/auth/info",
          responses={
              200: {"description": "Authentication information"},
@@ -848,4 +1339,16 @@ async def get_auth_info(auth_info: Dict[str, Any] = Depends(verify_authenticatio
 
 if __name__ == "__main__":
     import uvicorn
+    import signal
+    
+    def signal_handler(signum, frame):
+        """Handle shutdown signals."""
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        if shutdown_handler:
+            asyncio.create_task(shutdown_handler.initiate_shutdown())
+    
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)

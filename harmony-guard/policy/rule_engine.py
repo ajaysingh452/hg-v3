@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 
-from core.models import AggregatedResult, DecisionType, SeverityLevel
+from ..core.models import AggregatedResult, DecisionType, SeverityLevel
 from .config_loader import PolicyConfigLoader, PolicyProfile, ThresholdConfig, DepartmentOverride, HardRule
 
 logger = logging.getLogger(__name__)

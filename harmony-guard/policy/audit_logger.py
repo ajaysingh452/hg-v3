@@ -9,7 +9,7 @@ from pathlib import Path
 import hashlib
 import uuid
 
-from core.models import AggregatedResult, DecisionType, SeverityLevel
+from ..core.models import AggregatedResult, DecisionType, SeverityLevel
 from .rule_engine import PolicyRuleResult
 
 

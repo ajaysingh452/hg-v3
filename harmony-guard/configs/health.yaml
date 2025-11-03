@@ -1,0 +1,142 @@
+# Health check configuration for Harmony Guard
+health_monitoring:
+  # General settings
+  enabled: true
+  check_interval: 30  # seconds
+  failure_threshold: 3  # consecutive failures before marking unhealthy
+  degraded_threshold: 2  # consecutive failures before marking degraded
+  
+  # System resource monitoring
+  system_resources:
+    enabled: true
+    cpu_threshold: 85.0  # percentage
+    memory_threshold: 85.0  # percentage
+    disk_threshold: 90.0  # percentage
+    check_interval: 10  # seconds
+    
+  # ML model health checks
+  ml_models:
+    enabled: true
+    test_inference: true
+    inference_timeout: 5.0  # seconds
+    memory_threshold: 2048  # MB
+    
+  # Database health checks
+  database:
+    enabled: false  # Enable if using database
+    connection_timeout: 3.0  # seconds
+    query_timeout: 5.0  # seconds
+    max_connections: 100
+    
+  # External service health checks
+  external_services:
+    enabled: false
+    services: []
+    # Example configuration:
+    # - name: "auth_service"
+    #   endpoint: "http://auth-service:8080/health"
+    #   timeout: 3.0
+    #   critical: true
+
+# Kubernetes probe configuration
+kubernetes:
+  # Liveness probe settings
+  liveness:
+    enabled: true
+    initial_delay_seconds: 30
+    period_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 3
+    success_threshold: 1
+    
+  # Readiness probe settings
+  readiness:
+    enabled: true
+    initial_delay_seconds: 15
+    period_seconds: 5
+    timeout_seconds: 3
+    failure_threshold: 3
+    success_threshold: 1
+    
+  # Startup probe settings (for slow-starting containers)
+  startup:
+    enabled: true
+    initial_delay_seconds: 10
+    period_seconds: 10
+    timeout_seconds: 5
+    failure_threshold: 30  # Allow up to 5 minutes for startup
+    success_threshold: 1
+
+# Graceful shutdown configuration
+graceful_shutdown:
+  enabled: true
+  timeout_seconds: 30
+  
+  # Shutdown sequence
+  sequence:
+    - step: "stop_health_monitoring"
+      timeout: 5
+    - step: "drain_requests"
+      timeout: 15
+    - step: "shutdown_components"
+      timeout: 10
+      
+  # Request draining
+  request_draining:
+    enabled: true
+    max_wait_seconds: 15
+    check_interval: 1
+    
+# Alerting configuration
+alerting:
+  enabled: true
+  
+  # Alert thresholds
+  thresholds:
+    consecutive_failures: 5
+    error_rate: 0.05  # 5%
+    response_time_p95: 1000  # milliseconds
+    
+  # Alert channels
+  channels:
+    log: true
+    metrics: true
+    webhook: false
+    # webhook_url: "http://alertmanager:9093/api/v1/alerts"
+    
+# Performance monitoring
+performance:
+  enabled: true
+  
+  # Metrics collection
+  metrics:
+    response_time_buckets: [0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
+    memory_usage_interval: 30  # seconds
+    cpu_usage_interval: 10  # seconds
+    
+  # Performance thresholds
+  thresholds:
+    max_response_time: 5.0  # seconds
+    max_memory_usage: 4096  # MB
+    max_cpu_usage: 90.0  # percentage
+    
+# Circuit breaker configuration
+circuit_breaker:
+  enabled: true
+  
+  # Failure thresholds
+  failure_threshold: 5
+  recovery_timeout: 30  # seconds
+  half_open_max_calls: 3
+  
+  # Component-specific settings
+  components:
+    preprocessor:
+      failure_threshold: 3
+      recovery_timeout: 15
+    classifier:
+      failure_threshold: 5
+      recovery_timeout: 60
+    lpe_engine:
+      failure_threshold: 3
+      recovery_timeout: 30

@@ -1,0 +1,103 @@
+# Logging configuration for Harmony Guard
+logging:
+  level: "INFO"
+  service_name: "harmony-guard"
+  version: "1.0.0"
+  
+  # File logging
+  file_path: "logs/harmony-guard.log"
+  audit_file_path: "logs/harmony-guard-audit.log"
+  
+  # PII masking configuration
+  pii_masking:
+    enabled: true
+    mask_char: "*"
+    preserve_length: true
+    
+    # Custom patterns for additional PII types
+    custom_patterns:
+      # Indian-specific patterns
+      voter_id: "[A-Z]{3}[0-9]{7}"
+      driving_license: "[A-Z]{2}[0-9]{13}"
+      passport: "[A-Z][0-9]{7}"
+      
+      # Corporate identifiers
+      employee_id: "EMP[0-9]{6}"
+      customer_id: "CUST[0-9]{8}"
+      
+      # API keys and tokens
+      jwt_token: "eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+"
+      bearer_token: "Bearer [A-Za-z0-9_-]+"
+
+# Log aggregation settings
+aggregation:
+  enabled: true
+  
+  # Elasticsearch configuration (if using ELK stack)
+  elasticsearch:
+    enabled: false
+    hosts:
+      - "http://elasticsearch:9200"
+    index_pattern: "harmony-guard-logs-{date}"
+    
+  # Fluentd configuration
+  fluentd:
+    enabled: false
+    host: "fluentd"
+    port: 24224
+    tag: "harmony-guard"
+    
+  # CloudWatch configuration (for AWS deployments)
+  cloudwatch:
+    enabled: false
+    log_group: "/aws/harmony-guard"
+    log_stream: "{hostname}-{date}"
+    region: "us-east-1"
+
+# Log retention policies
+retention:
+  # Local file retention
+  local_files:
+    max_days: 30
+    max_size_mb: 1000
+    
+  # Audit log retention (longer for compliance)
+  audit_files:
+    max_days: 365
+    max_size_mb: 5000
+    
+  # Remote log retention
+  remote_logs:
+    max_days: 90
+
+# Performance settings
+performance:
+  # Async logging to avoid blocking
+  async_logging: true
+  
+  # Buffer size for batch logging
+  buffer_size: 1000
+  
+  # Flush interval in seconds
+  flush_interval: 5
+  
+  # Maximum log entry size
+  max_entry_size: 10240
+
+# Security settings
+security:
+  # Encrypt logs at rest
+  encryption:
+    enabled: false
+    key_rotation_days: 90
+    
+  # Log integrity verification
+  integrity_check:
+    enabled: false
+    hash_algorithm: "sha256"
+    
+  # Access control for log files
+  access_control:
+    file_permissions: "640"
+    owner: "harmony-guard"
+    group: "logs"

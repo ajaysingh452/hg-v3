@@ -10,12 +10,12 @@ parent_dir = os.path.dirname(current_dir)
 if parent_dir not in sys.path:
     sys.path.insert(0, parent_dir)
 
-from core.interfaces import IntentContextLayerInterface
-from core.models import ProcessedText, LPEResult, ClassifierResult, ContextResult, DecisionType
-from intent.negation_detector import NegationDetector
-from intent.quotation_detector import QuotationDetector
-from intent.safe_context_detector import SafeContextDetector
-from intent.confidence_adjuster import ContextAwareConfidenceAdjuster
+from ..core.interfaces import IntentContextLayerInterface
+from ..core.models import ProcessedText, LPEResult, ClassifierResult, ContextResult, DecisionType
+from .negation_detector import NegationDetector
+from .quotation_detector import QuotationDetector
+from .safe_context_detector import SafeContextDetector
+from .confidence_adjuster import ContextAwareConfidenceAdjuster
 
 
 class ContextAnalyzer(IntentContextLayerInterface):
